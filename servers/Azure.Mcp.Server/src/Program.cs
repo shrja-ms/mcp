@@ -103,6 +103,7 @@ internal class Program
             new Azure.Mcp.Tools.Advisor.AdvisorSetup(),
             new Azure.Mcp.Tools.BicepSchema.BicepSchemaSetup(),
             new Azure.Mcp.Tools.Cosmos.CosmosSetup(),
+            new Azure.Mcp.Tools.DataProtection.DataProtectionSetup(),
             new Azure.Mcp.Tools.CloudArchitect.CloudArchitectSetup(),
             new Azure.Mcp.Tools.Communication.CommunicationSetup(),
             new Azure.Mcp.Tools.Compute.ComputeSetup(),
