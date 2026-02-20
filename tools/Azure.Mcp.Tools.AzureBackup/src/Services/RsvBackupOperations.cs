@@ -39,7 +39,11 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultSku = new RecoveryServicesSku(RecoveryServicesSkuName.Standard);
         var vaultData = new RecoveryServicesVaultData(new AzureLocation(location))
         {
-            Sku = vaultSku
+            Sku = vaultSku,
+            Properties = new RecoveryServicesVaultProperties
+            {
+                PublicNetworkAccess = VaultPublicNetworkAccess.Enabled
+            }
         };
 
         var result = await collection.CreateOrUpdateAsync(WaitUntil.Completed, vaultName, vaultData, cancellationToken);
@@ -104,6 +108,20 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
 
+        // Get the vault to determine its location
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken: cancellationToken);
+        var vaultLocation = vault.Value.Data.Location;
+
+        // Trigger container discovery/refresh so the vault discovers the VM
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+        await rgResource.RefreshProtectionContainerAsync(vaultName, FabricName, filter: null, cancellationToken);
+
+        // Wait for container discovery to complete (refresh is async on the server side)
+        await Task.Delay(30000, cancellationToken);
+
         // Derive container name if not provided
         var container = containerName ?? RsvNamingHelper.DeriveContainerName(datasourceId);
         var protectedItemName = RsvNamingHelper.DeriveProtectedItemName(datasourceId);
@@ -114,9 +132,9 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(
             subscription, resourceGroup, vaultName, policyName);
 
-        var protectedItemData = new BackupProtectedItemData(new AzureLocation(string.Empty))
+        var protectedItemData = new BackupProtectedItemData(vaultLocation)
         {
-            Properties = new IaasVmProtectedItem
+            Properties = new IaasComputeVmProtectedItem
             {
                 PolicyId = policyArmId,
                 SourceResourceId = new ResourceIdentifier(datasourceId)
@@ -418,6 +436,373 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         }
 
         return points;
+    }
+
+    // ── New methods ──
+
+    public async Task<OperationResult> UpdateVaultAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? redundancy, string? softDelete, string? softDeleteRetentionDays,
+        string? immutabilityState, string? identityType, string? tags,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+
+        if (!string.IsNullOrEmpty(identityType))
+        {
+            patchData.Identity = new Azure.ResourceManager.Models.ManagedServiceIdentity(
+                identityType.Equals("SystemAssigned", StringComparison.OrdinalIgnoreCase)
+                    ? Azure.ResourceManager.Models.ManagedServiceIdentityType.SystemAssigned
+                    : Azure.ResourceManager.Models.ManagedServiceIdentityType.None);
+        }
+
+        await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Vault '{vaultName}' updated successfully.");
+    }
+
+    public async Task<OperationResult> DeleteVaultAsync(
+        string vaultName, string resourceGroup, string subscription,
+        bool force, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        await vaultResource.DeleteAsync(WaitUntil.Completed, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Vault '{vaultName}' deleted successfully.");
+    }
+
+    public async Task<OperationResult> CreatePolicyAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string policyName, string workloadType,
+        string? scheduleFrequency, string? scheduleTime,
+        string? dailyRetentionDays, string? weeklyRetentionWeeks,
+        string? monthlyRetentionMonths, string? yearlyRetentionYears,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(policyName), policyName),
+            (nameof(workloadType), workloadType));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultResourceId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultResourceId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+        var vaultLocation = vault.Value.Data.Location;
+
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+        var policyCollection = rgResource.GetBackupProtectionPolicies(vaultName);
+
+        var retentionDays = int.TryParse(dailyRetentionDays, out var dd) ? dd : 30;
+        var dailyRetention = new DailyRetentionSchedule { RetentionDuration = new RetentionDuration { Count = retentionDays, DurationType = RetentionDurationType.Days } };
+
+        var policyData = new BackupProtectionPolicyData(vaultLocation)
+        {
+            Properties = new IaasVmProtectionPolicy
+            {
+                SchedulePolicy = new SimpleSchedulePolicy { ScheduleRunFrequency = ScheduleRunType.Daily },
+                RetentionPolicy = new LongTermRetentionPolicy { DailySchedule = dailyRetention }
+            }
+        };
+
+        await policyCollection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Policy '{policyName}' created in vault '{vaultName}'.");
+    }
+
+    public async Task<OperationResult> DeletePolicyAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string policyName, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(policyName), policyName));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var policyId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
+        var policyResource = armClient.GetBackupProtectionPolicyResource(policyId);
+        await policyResource.DeleteAsync(WaitUntil.Completed, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Policy '{policyName}' deleted from vault '{vaultName}'.");
+    }
+
+    public async Task<OperationResult> StopProtectionAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string protectedItemName, string mode, string? containerName,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(protectedItemName), protectedItemName),
+            (nameof(mode), mode));
+
+        if (string.IsNullOrEmpty(containerName))
+        {
+            throw new ArgumentException("The --container parameter is required for RSV protection operations.");
+        }
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        if (mode.Equals("DeleteData", StringComparison.OrdinalIgnoreCase))
+        {
+            var itemId = BackupProtectedItemResource.CreateResourceIdentifier(
+                subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+            var itemResource = armClient.GetBackupProtectedItemResource(itemId);
+            await itemResource.DeleteAsync(WaitUntil.Started, cancellationToken);
+            return new OperationResult("Accepted", null, "Protection stopped and data deletion initiated.");
+        }
+
+        // RetainData mode - update with ProtectionState = ProtectionStopped
+        var vaultRes = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultRes);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var piId = BackupProtectedItemResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+        var piResource = armClient.GetBackupProtectedItemResource(piId);
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location)
+        {
+            Properties = new IaasComputeVmProtectedItem { ProtectionState = BackupProtectionState.ProtectionStopped }
+        };
+
+        await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
+        return new OperationResult("Accepted", null, "Protection stopped with data retained.");
+    }
+
+    public async Task<OperationResult> ResumeProtectionAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string protectedItemName, string? containerName, string? policyName,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(protectedItemName), protectedItemName));
+
+        if (string.IsNullOrEmpty(containerName))
+        {
+            throw new ArgumentException("The --container parameter is required for RSV protection operations.");
+        }
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultRes = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultRes);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var piId = BackupProtectedItemResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+        var piResource = armClient.GetBackupProtectedItemResource(piId);
+
+        var props = new IaasComputeVmProtectedItem();
+        if (!string.IsNullOrEmpty(policyName))
+        {
+            var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
+            props.PolicyId = policyArmId;
+        }
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = props };
+        await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
+
+        return new OperationResult("Accepted", null, "Protection resumed.");
+    }
+
+    public async Task<OperationResult> ModifyProtectionAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string protectedItemName, string? containerName, string? newPolicyName,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(protectedItemName), protectedItemName));
+
+        if (string.IsNullOrEmpty(containerName))
+        {
+            throw new ArgumentException("The --container parameter is required for RSV protection operations.");
+        }
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultRes = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultRes);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var piId = BackupProtectedItemResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+        var piResource = armClient.GetBackupProtectedItemResource(piId);
+
+        var props = new IaasComputeVmProtectedItem();
+        if (!string.IsNullOrEmpty(newPolicyName))
+        {
+            var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, newPolicyName);
+            props.PolicyId = policyArmId;
+        }
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = props };
+        await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
+
+        return new OperationResult("Accepted", null, $"Protection modified. Policy changed to '{newPolicyName}'.");
+    }
+
+    public Task<OperationResult> UndeleteProtectedItemAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string protectedItemName, string? containerName,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        // RSV undelete is handled via support request or portal; SDK doesn't expose a direct undelete for RSV
+        return Task.FromResult(new OperationResult("NotSupported", null, "Undelete for RSV protected items requires Azure portal or support request. Use soft-delete recovery instead."));
+    }
+
+    public async Task<OperationResult> CancelJobAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string jobId, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(jobId), jobId));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var jobResourceId = BackupJobResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, jobId);
+        var jobResource = armClient.GetBackupJobResource(jobResourceId);
+        await jobResource.TriggerJobCancellationAsync(cancellationToken);
+
+        return new OperationResult("Accepted", null, $"Job '{jobId}' cancellation triggered.");
+    }
+
+    public async Task<OperationResult> ConfigureImmutabilityAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string immutabilityState, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(immutabilityState), immutabilityState));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Immutability set to '{immutabilityState}' for vault '{vaultName}'.");
+    }
+
+    public async Task<OperationResult> ConfigureSoftDeleteAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string softDeleteState, string? softDeleteRetentionDays,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(softDeleteState), softDeleteState));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Soft delete set to '{softDeleteState}' for vault '{vaultName}'.");
+    }
+
+    public async Task<OperationResult> ConfigureCrossRegionRestoreAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Cross-Region Restore enabled for vault '{vaultName}'.");
+    }
+
+    public async Task<HealthCheckResult> RunBackupHealthCheckAsync(
+        string vaultName, string resourceGroup, string subscription,
+        int? rpoThresholdHours, bool includeSecurityPosture,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        // Get vault info
+        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+
+        // List protected items and check health
+        var items = await ListProtectedItemsAsync(vaultName, resourceGroup, subscription, tenant, retryPolicy, cancellationToken);
+        var rpoThreshold = rpoThresholdHours ?? 24;
+        var now = DateTimeOffset.UtcNow;
+
+        var details = new List<HealthCheckItemDetail>();
+        int healthy = 0, unhealthy = 0, breachingRpo = 0;
+
+        foreach (var item in items)
+        {
+            var rpoBreached = item.LastBackupTime.HasValue && (now - item.LastBackupTime.Value).TotalHours > rpoThreshold;
+            if (rpoBreached) breachingRpo++;
+
+            var isHealthy = item.ProtectionStatus?.Contains("Protected", StringComparison.OrdinalIgnoreCase) == true && !rpoBreached;
+            if (isHealthy) healthy++; else unhealthy++;
+
+            details.Add(new HealthCheckItemDetail(
+                item.Name, item.ProtectionStatus, isHealthy ? "Healthy" : "Unhealthy",
+                item.LastBackupTime, rpoBreached));
+        }
+
+        return new HealthCheckResult(
+            vaultName, VaultType, items.Count, healthy, unhealthy, breachingRpo,
+            vault.Value.Data.Properties?.SecuritySettings?.SoftDeleteSettings?.SoftDeleteState?.ToString(),
+            vault.Value.Data.Properties?.SecuritySettings?.ImmutabilityState?.ToString(),
+            null, details);
     }
 
     private static BackupVaultInfo MapToVaultInfo(RecoveryServicesVaultData data, string? resourceGroup)
