@@ -365,7 +365,7 @@ public static class AzureBackupOptionDefinitions
 
     public static readonly Option<string> BackupType = new($"--{BackupTypeName}")
     {
-        Description = "Backup type: 'Full', 'Differential', 'Log', or 'CopyOnlyFull'.",
+        Description = "Backup type: 'Full', 'Differential', 'Log', 'CopyOnlyFull', 'SnapshotFull', 'SnapshotCopyOnlyFull', or 'Incremental'.",
         Required = false
     };
 

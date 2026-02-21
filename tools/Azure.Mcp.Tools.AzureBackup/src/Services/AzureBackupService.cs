@@ -105,14 +105,14 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
     public async Task<BackupTriggerResult> TriggerBackupAsync(
         string vaultName, string resourceGroup, string subscription,
         string protectedItemName, string? vaultType, string? containerName,
-        string? expiry, string? tenant,
+        string? expiry, string? backupType, string? tenant,
         RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         var resolvedType = await ResolveVaultTypeAsync(vaultName, resourceGroup, subscription, vaultType, tenant, retryPolicy, cancellationToken);
 
         return VaultTypeResolver.IsRsv(resolvedType)
-            ? await rsvOps.TriggerBackupAsync(vaultName, resourceGroup, subscription, protectedItemName, containerName, expiry, tenant, retryPolicy, cancellationToken)
-            : await dppOps.TriggerBackupAsync(vaultName, resourceGroup, subscription, protectedItemName, expiry, tenant, retryPolicy, cancellationToken);
+            ? await rsvOps.TriggerBackupAsync(vaultName, resourceGroup, subscription, protectedItemName, containerName, expiry, backupType, tenant, retryPolicy, cancellationToken)
+            : await dppOps.TriggerBackupAsync(vaultName, resourceGroup, subscription, protectedItemName, expiry, backupType, tenant, retryPolicy, cancellationToken);
     }
 
     public async Task<RestoreTriggerResult> TriggerRestoreAsync(

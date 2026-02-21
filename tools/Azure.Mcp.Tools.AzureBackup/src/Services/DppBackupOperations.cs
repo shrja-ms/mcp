@@ -182,8 +182,8 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 
     public async Task<BackupTriggerResult> TriggerBackupAsync(
         string vaultName, string resourceGroup, string subscription,
-        string protectedItemName, string? expiry, string? tenant,
-        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+        string protectedItemName, string? expiry, string? backupType,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         ValidateRequiredParameters(
             (nameof(vaultName), vaultName),
@@ -195,7 +195,8 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var instanceId = DataProtectionBackupInstanceResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, protectedItemName);
         var instanceResource = armClient.GetDataProtectionBackupInstanceResource(instanceId);
 
-        var ruleOption = new AdhocBackupRules("BackupNow", "Default");
+        var ruleName = !string.IsNullOrEmpty(backupType) ? backupType : "BackupNow";
+        var ruleOption = new AdhocBackupRules(ruleName, "Default");
         var backupContent = new AdhocBackupTriggerContent(ruleOption);
 
         var result = await instanceResource.TriggerAdhocBackupAsync(WaitUntil.Started, backupContent, cancellationToken);

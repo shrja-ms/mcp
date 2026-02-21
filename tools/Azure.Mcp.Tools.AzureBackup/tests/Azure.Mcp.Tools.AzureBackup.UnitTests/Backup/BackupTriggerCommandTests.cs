@@ -49,6 +49,7 @@ public class BackupTriggerCommandTests
             Arg.Is("item1"),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(expectedResult));
 
@@ -76,6 +77,7 @@ public class BackupTriggerCommandTests
             Arg.Any<string>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new RequestFailedException((int)HttpStatusCode.NotFound, "Not found"));
 
@@ -95,6 +97,7 @@ public class BackupTriggerCommandTests
             Arg.Any<string>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new Exception("Test error"));
 
@@ -125,6 +128,7 @@ public class BackupTriggerCommandTests
             Arg.Any<string>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(expectedResult));
 
@@ -136,6 +140,7 @@ public class BackupTriggerCommandTests
             "vault1", "rg1", "sub123", "item1",
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>());
     }
 }

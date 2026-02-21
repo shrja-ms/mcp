@@ -25,7 +25,7 @@ public sealed class BackupTriggerCommand(ILogger<BackupTriggerCommand> logger) :
         """
         Triggers an on-demand backup for a protected item or backup instance.
         The operation is asynchronous; use 'azurebackup job get' to monitor the backup job progress.
-        Optionally specify a recovery point expiry time.
+        Optionally specify a recovery point expiry time and backup type ('Full', 'Differential', 'Log', 'CopyOnlyFull', 'SnapshotFull', 'SnapshotCopyOnlyFull', or 'Incremental').
         """;
     public override string Title => CommandTitle;
     public override ToolMetadata Metadata => new()
@@ -38,12 +38,14 @@ public sealed class BackupTriggerCommand(ILogger<BackupTriggerCommand> logger) :
     {
         base.RegisterOptions(command);
         command.Options.Add(AzureBackupOptionDefinitions.Expiry);
+        command.Options.Add(AzureBackupOptionDefinitions.BackupType);
     }
 
     protected override BackupTriggerOptions BindOptions(ParseResult parseResult)
     {
         var options = base.BindOptions(parseResult);
         options.Expiry = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.Expiry.Name);
+        options.BackupType = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.BackupType.Name);
         return options;
     }
 
@@ -67,6 +69,7 @@ public sealed class BackupTriggerCommand(ILogger<BackupTriggerCommand> logger) :
                 options.VaultType,
                 options.Container,
                 options.Expiry,
+                options.BackupType,
                 options.Tenant,
                 options.RetryPolicy,
                 cancellationToken);

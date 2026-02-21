@@ -9,4 +9,7 @@ public class BackupTriggerOptions : BaseProtectedItemOptions
 {
     [JsonPropertyName(AzureBackupOptionDefinitions.ExpiryName)]
     public string? Expiry { get; set; }
+
+    [JsonPropertyName(AzureBackupOptionDefinitions.BackupTypeName)]
+    public string? BackupType { get; set; }
 }

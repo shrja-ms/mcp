@@ -207,7 +207,7 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
     public async Task<BackupTriggerResult> TriggerBackupAsync(
         string vaultName, string resourceGroup, string subscription,
         string protectedItemName, string? containerName, string? expiry,
-        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+        string? backupType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         ValidateRequiredParameters(
             (nameof(vaultName), vaultName),
@@ -233,10 +233,7 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         var backupContent = new TriggerBackupContent(new AzureLocation(string.Empty))
         {
-            Properties = new IaasVmBackupContent
-            {
-                RecoveryPointExpireOn = expiryTime
-            }
+            Properties = CreateBackupRequestContent(backupType, expiryTime)
         };
 
         var result = await itemResource.TriggerBackupAsync(backupContent, cancellationToken);
@@ -246,6 +243,17 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             "Accepted",
             jobId,
             jobId != null ? $"Backup triggered. Use 'azurebackup job get --job {jobId}' to monitor progress." : "Backup triggered.");
+    }
+
+    private static BackupContent CreateBackupRequestContent(string? backupType, DateTimeOffset? expiryTime)
+    {
+        // IaasVmBackupContent is used for RSV workloads. The backupType parameter
+        // is informational for RSV (defaults to full); it is primarily used for DPP (Backup vault) scenarios.
+        _ = backupType; // Reserved for future RSV backup type support
+        return new IaasVmBackupContent
+        {
+            RecoveryPointExpireOn = expiryTime
+        };
     }
 
     public async Task<RestoreTriggerResult> TriggerRestoreAsync(
