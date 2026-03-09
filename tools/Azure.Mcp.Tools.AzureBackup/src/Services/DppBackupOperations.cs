@@ -111,6 +111,7 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
         var vaultId = DataProtectionBackupVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
         var vaultResource = armClient.GetDataProtectionBackupVaultResource(vaultId);
+        var vaultData = await vaultResource.GetAsync(cancellationToken);
         var collection = vaultResource.GetDataProtectionBackupInstances();
 
         var policyId = DataProtectionBackupPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
@@ -118,10 +119,21 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var instanceName = $"{datasourceResourceId.Name}-{datasourceResourceId.Name}-{Guid.NewGuid().ToString("N")[..12]}";
 
         var policyInfo = new BackupInstancePolicyInfo(policyId);
+        var dataSourceInfo = new DataSourceInfo(datasourceResourceId)
+        {
+            DataSourceType = datasourceType ?? datasourceResourceId.ResourceType.ToString(),
+            ObjectType = "Datasource",
+            ResourceType = datasourceResourceId.ResourceType,
+            ResourceName = datasourceResourceId.Name,
+            ResourceLocation = vaultData.Value.Data.Location,
+        };
         var instanceProperties = new DataProtectionBackupInstanceProperties(
-            new DataSourceInfo(datasourceResourceId),
+            dataSourceInfo,
             policyInfo,
-            string.Empty);
+            string.Empty)
+        {
+            ObjectType = "BackupInstance",
+        };
         var instanceData = new DataProtectionBackupInstanceData
         {
             Properties = instanceProperties
@@ -195,7 +207,24 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var instanceId = DataProtectionBackupInstanceResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, protectedItemName);
         var instanceResource = armClient.GetDataProtectionBackupInstanceResource(instanceId);
 
-        var ruleName = !string.IsNullOrEmpty(backupType) ? backupType : "BackupNow";
+        // Fetch backup instance to get associated policy
+        var instanceData = await instanceResource.GetAsync(cancellationToken);
+        var policyId = instanceData.Value.Data.Properties.PolicyInfo.PolicyId;
+
+        // Fetch policy to find the backup rule name
+        var policyResource = armClient.GetDataProtectionBackupPolicyResource(policyId);
+        var policyData = await policyResource.GetAsync(cancellationToken);
+
+        string ruleName = "BackupDaily";
+        if (policyData.Value.Data.Properties is RuleBasedBackupPolicy ruleBasedPolicy)
+        {
+            var backupRule = ruleBasedPolicy.PolicyRules.FirstOrDefault(r => r is DataProtectionBackupRule);
+            if (backupRule != null)
+            {
+                ruleName = backupRule.Name;
+            }
+        }
+
         var ruleOption = new AdhocBackupRules(ruleName, "Default");
         var backupContent = new AdhocBackupTriggerContent(ruleOption);
 
@@ -227,17 +256,78 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         // Get the backup instance to determine datasource info
         var instance = await instanceResource.GetAsync(cancellationToken);
-        var datasourceId = instance.Value.Data.Properties?.DataSourceInfo?.ResourceId;
+        var datasourceInfo = instance.Value.Data.Properties?.DataSourceInfo;
+        var datasourceId = datasourceInfo?.ResourceId;
+        var location = !string.IsNullOrEmpty(restoreLocation) ? new AzureLocation(restoreLocation) : datasourceInfo?.ResourceLocation;
 
-        var targetId = !string.IsNullOrEmpty(targetResourceId) ? new ResourceIdentifier(targetResourceId) : datasourceId;
-        var location = !string.IsNullOrEmpty(restoreLocation) ? new AzureLocation(restoreLocation) : instance.Value.Data.Properties?.DataSourceInfo?.ResourceLocation;
+        RestoreTargetInfoBase restoreTarget;
 
-        var restoreTarget = new RestoreTargetInfo(
-            new RecoverySetting(),
-            new DataSourceInfo(targetId ?? datasourceId!)
+        // Determine if this is a restore-as-files scenario (target is a storage account)
+        if (!string.IsNullOrEmpty(targetResourceId) &&
+            targetResourceId.Contains("Microsoft.Storage/storageAccounts", StringComparison.OrdinalIgnoreCase))
+        {
+            // Restore-as-files: target is a storage account with optional container
+            var storageAccountId = targetResourceId;
+            var containerName = "pgflex-restore";
+
+            // Extract container name from the target resource ID if it includes a container
+            // e.g., .../storageAccounts/name/blobServices/default/containers/containerName
+            if (targetResourceId.Contains("/blobServices/", StringComparison.OrdinalIgnoreCase))
             {
-                ResourceLocation = location
-            });
+                var parts = targetResourceId.Split('/');
+                containerName = parts[^1];
+                var containerIndex = targetResourceId.IndexOf("/blobServices/", StringComparison.OrdinalIgnoreCase);
+                storageAccountId = targetResourceId[..containerIndex];
+            }
+
+            // Extract storage account name from the ARM ID
+            var storageAccountArmId = new ResourceIdentifier(storageAccountId);
+            var storageAccountName = storageAccountArmId.Name;
+
+            var containerUri = new Uri($"https://{storageAccountName}.blob.core.windows.net/{containerName}");
+            var filePrefix = $"pgflex-restore-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+
+            // TargetResourceArmId must point to the container (not the storage account)
+            // per the REST API spec: "ARM Id pointing to container / file share"
+            var containerArmId = new ResourceIdentifier(
+                $"{storageAccountId}/blobServices/default/containers/{containerName}");
+
+            var targetDetails = new RestoreFilesTargetDetails(
+                filePrefix,
+                RestoreTargetLocationType.AzureBlobs,
+                containerUri)
+            {
+                TargetResourceArmId = containerArmId,
+            };
+
+            restoreTarget = new RestoreFilesTargetInfo(
+                RecoverySetting.FailIfExists,
+                targetDetails)
+            {
+                RestoreLocation = location,
+            };
+        }
+        else
+        {
+            // Restore-as-server: target is a datasource resource
+            var targetId = !string.IsNullOrEmpty(targetResourceId) ? new ResourceIdentifier(targetResourceId) : datasourceId;
+
+            var targetDatasource = new DataSourceInfo(targetId ?? datasourceId!)
+            {
+                ObjectType = "Datasource",
+                DataSourceType = datasourceInfo?.DataSourceType,
+                ResourceType = targetId?.ResourceType ?? datasourceId?.ResourceType,
+                ResourceName = targetId?.Name ?? datasourceId?.Name,
+                ResourceLocation = location,
+            };
+
+            restoreTarget = new RestoreTargetInfo(
+                RecoverySetting.FailIfExists,
+                targetDatasource)
+            {
+                RestoreLocation = location,
+            };
+        }
 
         var restoreContent = new BackupRecoveryPointBasedRestoreContent(
             restoreTarget,
@@ -452,9 +542,42 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultResource = armClient.GetDataProtectionBackupVaultResource(vaultId);
         var collection = vaultResource.GetDataProtectionBackupPolicies();
 
-        // Create a basic DPP policy
+        // Parse retention and schedule parameters
         var retentionDays = int.TryParse(dailyRetentionDays, out var dd) ? dd : 30;
-        var policyProperties = new RuleBasedBackupPolicy([workloadType], []);
+        var scheduleTimeValue = scheduleTime ?? "02:00";
+        var now = DateTimeOffset.UtcNow;
+        var scheduleParts = scheduleTimeValue.Split(':');
+        var scheduleHour = int.TryParse(scheduleParts[0], out var sh) ? sh : 2;
+        var scheduleMinute = scheduleParts.Length > 1 && int.TryParse(scheduleParts[1], out var sm) ? sm : 0;
+        var scheduleStartTime = new DateTimeOffset(now.Year, now.Month, now.Day, scheduleHour, scheduleMinute, 0, TimeSpan.Zero);
+        var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/P1D";
+
+        // Build the retention rule (Default)
+        var retentionDeleteSetting = new DataProtectionBackupAbsoluteDeleteSetting(TimeSpan.FromDays(retentionDays));
+        var retentionDataStore = new DataStoreInfoBase(DataStoreType.VaultStore, "DataStoreInfoBase");
+        var retentionLifeCycle = new SourceLifeCycle(retentionDeleteSetting, retentionDataStore);
+        var retentionRule = new DataProtectionRetentionRule("Default", [retentionLifeCycle])
+        {
+            IsDefault = true,
+        };
+
+        // Build the backup rule (BackupDaily)
+        var schedule = new DataProtectionBackupSchedule([repeatingInterval])
+        {
+            TimeZone = "UTC",
+        };
+        var defaultTag = new DataProtectionBackupRetentionTag("Default");
+        var taggingCriteria = new DataProtectionBackupTaggingCriteria(true, 99, defaultTag);
+        var triggerContext = new ScheduleBasedBackupTriggerContext(schedule, [taggingCriteria]);
+        var backupDataStore = new DataStoreInfoBase(DataStoreType.VaultStore, "DataStoreInfoBase");
+        var backupRule = new DataProtectionBackupRule("BackupDaily", backupDataStore, triggerContext)
+        {
+            BackupParameters = new DataProtectionBackupSettings("Full"),
+        };
+
+        var policyProperties = new RuleBasedBackupPolicy(
+            [workloadType],
+            [retentionRule, backupRule]);
         var policyData = new DataProtectionBackupPolicyData { Properties = policyProperties };
 
         await collection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);
