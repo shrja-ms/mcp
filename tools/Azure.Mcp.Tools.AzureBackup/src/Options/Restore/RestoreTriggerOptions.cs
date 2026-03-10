@@ -15,4 +15,10 @@ public class RestoreTriggerOptions : BaseProtectedItemOptions
 
     [JsonPropertyName(AzureBackupOptionDefinitions.RestoreLocationName)]
     public string? RestoreLocation { get; set; }
+
+    [JsonPropertyName(AzureBackupOptionDefinitions.StagingStorageAccountIdName)]
+    public string? StagingStorageAccountId { get; set; }
+
+    [JsonPropertyName(AzureBackupOptionDefinitions.PointInTimeName)]
+    public string? PointInTime { get; set; }
 }

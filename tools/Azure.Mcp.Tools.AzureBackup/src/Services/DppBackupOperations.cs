@@ -17,6 +17,43 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 {
     private const string VaultType = VaultTypeResolver.Dpp;
 
+    /// <summary>
+    /// Maps friendly workload type names to ARM resource type strings for DPP policies.
+    /// </summary>
+    private static string MapWorkloadTypeToArmResourceType(string workloadType) => workloadType.ToLowerInvariant() switch
+    {
+        "azuredisk" => "Microsoft.Compute/disks",
+        "azureblob" => "Microsoft.Storage/storageAccounts/blobServices",
+        "postgresqlflexible" => "Microsoft.DBforPostgreSQL/flexibleServers",
+        "mysqlflexible" => "Microsoft.DBforMySQL/flexibleServers",
+        "aks" => "Microsoft.ContainerService/managedClusters",
+        _ => workloadType // If already an ARM resource type, pass through
+    };
+
+    /// <summary>
+    /// Determines if a DPP datasource type uses OperationalStore (snapshot-based) vs VaultStore.
+    /// </summary>
+    private static bool UsesOperationalStore(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    {
+        "microsoft.compute/disks" => true,
+        "microsoft.storage/storageaccounts/blobservices" => true,
+        "microsoft.containerservice/managedclusters" => true,
+        "azuredisk" => true,
+        "azureblob" => true,
+        "aks" => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Determines if a datasource type is for blob operational backup (continuous, no scheduled backup rule).
+    /// </summary>
+    private static bool IsBlobOperationalBackup(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    {
+        "microsoft.storage/storageaccounts/blobservices" => true,
+        "azureblob" => true,
+        _ => false
+    };
+
     public async Task<VaultCreateResult> CreateVaultAsync(
         string vaultName, string resourceGroup, string subscription, string location,
         string? sku, string? storageType, string? tenant,
@@ -116,12 +153,38 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         var policyId = DataProtectionBackupPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
         var datasourceResourceId = new ResourceIdentifier(datasourceId);
+
+        // Auto-detect blob storage: if the datasource is a storage account, set the datasource type
+        // to blobServices but keep the resource ID pointing to the storage account (not blobServices/default)
+        var resolvedDatasourceType = datasourceType ?? datasourceResourceId.ResourceType.ToString();
+        if (resolvedDatasourceType.Equals("Microsoft.Storage/storageAccounts", StringComparison.OrdinalIgnoreCase)
+            && !datasourceId.Contains("/blobServices/", StringComparison.OrdinalIgnoreCase))
+        {
+            // Blob operational backup uses storageAccounts/blobServices as the datasource type
+            // but the resource ID stays as the storage account (no /blobServices/default appended)
+            resolvedDatasourceType = "Microsoft.Storage/storageAccounts/blobServices";
+        }
+
         var instanceName = $"{datasourceResourceId.Name}-{datasourceResourceId.Name}-{Guid.NewGuid().ToString("N")[..12]}";
 
         var policyInfo = new BackupInstancePolicyInfo(policyId);
+
+        // For Disk and AKS workloads that use OperationalStore (snapshot-based),
+        // set the snapshot resource group parameter (defaults to the datasource's resource group)
+        if (UsesOperationalStore(resolvedDatasourceType) && !IsBlobOperationalBackup(resolvedDatasourceType))
+        {
+            var snapshotRgId = ResourceGroupResource.CreateResourceIdentifier(subscription, datasourceResourceId.ResourceGroupName ?? resourceGroup);
+            var opStoreSettings = new OperationalDataStoreSettings(DataStoreType.OperationalStore)
+            {
+                ResourceGroupId = snapshotRgId,
+            };
+            policyInfo.PolicyParameters = new BackupInstancePolicySettings();
+            policyInfo.PolicyParameters.DataStoreParametersList.Add(opStoreSettings);
+        }
+
         var dataSourceInfo = new DataSourceInfo(datasourceResourceId)
         {
-            DataSourceType = datasourceType ?? datasourceResourceId.ResourceType.ToString(),
+            DataSourceType = resolvedDatasourceType,
             ObjectType = "Datasource",
             ResourceType = datasourceResourceId.ResourceType,
             ResourceName = datasourceResourceId.Name,
@@ -239,16 +302,15 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 
     public async Task<RestoreTriggerResult> TriggerRestoreAsync(
         string vaultName, string resourceGroup, string subscription,
-        string protectedItemName, string recoveryPointId,
-        string? targetResourceId, string? restoreLocation, string? tenant,
+        string protectedItemName, string? recoveryPointId,
+        string? targetResourceId, string? restoreLocation, string? pointInTime, string? tenant,
         RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         ValidateRequiredParameters(
             (nameof(vaultName), vaultName),
             (nameof(resourceGroup), resourceGroup),
             (nameof(subscription), subscription),
-            (nameof(protectedItemName), protectedItemName),
-            (nameof(recoveryPointId), recoveryPointId));
+            (nameof(protectedItemName), protectedItemName));
 
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
         var instanceId = DataProtectionBackupInstanceResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, protectedItemName);
@@ -329,10 +391,35 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             };
         }
 
-        var restoreContent = new BackupRecoveryPointBasedRestoreContent(
-            restoreTarget,
-            SourceDataStoreType.VaultStore,
-            recoveryPointId);
+        // Determine the correct source data store type based on datasource type
+        var datasourceTypeStr = datasourceInfo?.DataSourceType ?? string.Empty;
+        var sourceDataStoreType = UsesOperationalStore(datasourceTypeStr) ? SourceDataStoreType.OperationalStore : SourceDataStoreType.VaultStore;
+
+        // Use time-based restore for blob PIT or when --point-in-time is provided
+        BackupRestoreContent restoreContent;
+        if (!string.IsNullOrEmpty(pointInTime))
+        {
+            if (!DateTimeOffset.TryParse(pointInTime, out var recoverOn))
+            {
+                throw new ArgumentException($"Invalid point-in-time format: '{pointInTime}'. Use ISO 8601 format (e.g., '2025-01-15T10:30:00Z').");
+            }
+
+            restoreContent = new BackupRecoveryTimeBasedRestoreContent(
+                restoreTarget,
+                sourceDataStoreType,
+                recoverOn);
+        }
+        else if (!string.IsNullOrEmpty(recoveryPointId))
+        {
+            restoreContent = new BackupRecoveryPointBasedRestoreContent(
+                restoreTarget,
+                sourceDataStoreType,
+                recoveryPointId);
+        }
+        else
+        {
+            throw new ArgumentException("Either --recovery-point or --point-in-time must be specified for restore.");
+        }
 
         var result = await instanceResource.TriggerRestoreAsync(WaitUntil.Started, restoreContent, cancellationToken);
         var jobId = ExtractJobIdFromOperation(result.GetRawResponse());
@@ -550,34 +637,54 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var scheduleHour = int.TryParse(scheduleParts[0], out var sh) ? sh : 2;
         var scheduleMinute = scheduleParts.Length > 1 && int.TryParse(scheduleParts[1], out var sm) ? sm : 0;
         var scheduleStartTime = new DateTimeOffset(now.Year, now.Month, now.Day, scheduleHour, scheduleMinute, 0, TimeSpan.Zero);
-        var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/P1D";
 
-        // Build the retention rule (Default)
-        var retentionDeleteSetting = new DataProtectionBackupAbsoluteDeleteSetting(TimeSpan.FromDays(retentionDays));
-        var retentionDataStore = new DataStoreInfoBase(DataStoreType.VaultStore, "DataStoreInfoBase");
+        // Map friendly workload type to ARM resource type and determine data store type
+        var resolvedWorkloadType = MapWorkloadTypeToArmResourceType(workloadType);
+        var useOperationalStore = UsesOperationalStore(workloadType);
+        var isBlobOperational = IsBlobOperationalBackup(workloadType);
+        var dataStoreType = useOperationalStore ? DataStoreType.OperationalStore : DataStoreType.VaultStore;
+
+        // Build the retention rule (Default) - use 7 days for operational store if not specified
+        var defaultRetention = useOperationalStore && !int.TryParse(dailyRetentionDays, out _) ? 7 : retentionDays;
+        var retentionDeleteSetting = new DataProtectionBackupAbsoluteDeleteSetting(TimeSpan.FromDays(defaultRetention));
+        var retentionDataStore = new DataStoreInfoBase(dataStoreType, "DataStoreInfoBase");
         var retentionLifeCycle = new SourceLifeCycle(retentionDeleteSetting, retentionDataStore);
         var retentionRule = new DataProtectionRetentionRule("Default", [retentionLifeCycle])
         {
             IsDefault = true,
         };
 
-        // Build the backup rule (BackupDaily)
-        var schedule = new DataProtectionBackupSchedule([repeatingInterval])
+        List<DataProtectionBasePolicyRule> rules = [retentionRule];
+
+        // Blob operational backup uses continuous mode - no scheduled backup rule needed
+        // For all other workloads, add a scheduled backup rule
+        if (!isBlobOperational)
         {
-            TimeZone = "UTC",
-        };
-        var defaultTag = new DataProtectionBackupRetentionTag("Default");
-        var taggingCriteria = new DataProtectionBackupTaggingCriteria(true, 99, defaultTag);
-        var triggerContext = new ScheduleBasedBackupTriggerContext(schedule, [taggingCriteria]);
-        var backupDataStore = new DataStoreInfoBase(DataStoreType.VaultStore, "DataStoreInfoBase");
-        var backupRule = new DataProtectionBackupRule("BackupDaily", backupDataStore, triggerContext)
-        {
-            BackupParameters = new DataProtectionBackupSettings("Full"),
-        };
+            // Disk and AKS use PT4H (hourly) schedule; VaultStore workloads use P1D (daily)
+            var scheduleInterval = useOperationalStore ? "PT4H" : "P1D";
+            var ruleName = useOperationalStore ? "BackupHourly" : "BackupDaily";
+            var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/{scheduleInterval}";
+
+            var schedule = new DataProtectionBackupSchedule([repeatingInterval])
+            {
+                TimeZone = "UTC",
+            };
+            var defaultTag = new DataProtectionBackupRetentionTag("Default");
+            var taggingCriteria = new DataProtectionBackupTaggingCriteria(true, 99, defaultTag);
+            var triggerContext = new ScheduleBasedBackupTriggerContext(schedule, [taggingCriteria]);
+            var backupDataStore = new DataStoreInfoBase(dataStoreType, "DataStoreInfoBase");
+            var backupRule = new DataProtectionBackupRule(ruleName, backupDataStore, triggerContext)
+            {
+                // Disk/AKS use "Incremental" backup type; VaultStore workloads use "Full"
+                BackupParameters = new DataProtectionBackupSettings(useOperationalStore ? "Incremental" : "Full"),
+            };
+
+            rules.Add(backupRule);
+        }
 
         var policyProperties = new RuleBasedBackupPolicy(
-            [workloadType],
-            [retentionRule, backupRule]);
+            [resolvedWorkloadType],
+            rules);
         var policyData = new DataProtectionBackupPolicyData { Properties = policyProperties };
 
         await collection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);

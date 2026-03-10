@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Azure.Mcp.Tools.AzureBackup.Commands.Backup;
 using Azure.Mcp.Tools.AzureBackup.Commands.Bulk;
+using Azure.Mcp.Tools.AzureBackup.Commands.Container;
 using Azure.Mcp.Tools.AzureBackup.Commands.Cost;
 using Azure.Mcp.Tools.AzureBackup.Commands.Diagnostics;
 using Azure.Mcp.Tools.AzureBackup.Commands.Dr;
@@ -14,6 +15,7 @@ using Azure.Mcp.Tools.AzureBackup.Commands.Job;
 using Azure.Mcp.Tools.AzureBackup.Commands.Monitoring;
 using Azure.Mcp.Tools.AzureBackup.Commands.Policy;
 using Azure.Mcp.Tools.AzureBackup.Commands.ProtectedItem;
+using Azure.Mcp.Tools.AzureBackup.Commands.ProtectableItem;
 using Azure.Mcp.Tools.AzureBackup.Commands.RecoveryPoint;
 using Azure.Mcp.Tools.AzureBackup.Commands.Restore;
 using Azure.Mcp.Tools.AzureBackup.Commands.Security;
@@ -51,6 +53,11 @@ namespace Azure.Mcp.Tools.AzureBackup.Commands;
 [JsonSerializable(typeof(BackupTriggerCommand.BackupTriggerCommandResult))]
 [JsonSerializable(typeof(BackupStatusCommand.BackupStatusCommandResult))]
 [JsonSerializable(typeof(RestoreTriggerCommand.RestoreTriggerCommandResult))]
+// Container
+[JsonSerializable(typeof(ContainerRegisterCommand.ContainerRegisterCommandResult))]
+[JsonSerializable(typeof(ContainerInquiryCommand.ContainerInquiryCommandResult))]
+// Protectable item
+[JsonSerializable(typeof(ProtectableItemListCommand.ProtectableItemListCommandResult))]
 // Security
 [JsonSerializable(typeof(SecurityRbacCommand.SecurityRbacCommandResult))]
 [JsonSerializable(typeof(SecurityMuaCommand.SecurityMuaCommandResult))]
@@ -96,6 +103,7 @@ namespace Azure.Mcp.Tools.AzureBackup.Commands;
 [JsonSerializable(typeof(BackupPolicyInfo))]
 [JsonSerializable(typeof(BackupJobInfo))]
 [JsonSerializable(typeof(RecoveryPointInfo))]
+[JsonSerializable(typeof(ProtectableItemInfo))]
 [JsonSerializable(typeof(VaultCreateResult))]
 [JsonSerializable(typeof(ProtectResult))]
 [JsonSerializable(typeof(BackupTriggerResult))]

@@ -49,7 +49,9 @@ public class RestoreTriggerCommandTests
             Arg.Is("item1"), Arg.Is("rp1"),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
-            Arg.Any<string?>(), Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
             Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(expectedResult));
 
@@ -74,10 +76,12 @@ public class RestoreTriggerCommandTests
     {
         _backupService.TriggerRestoreAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(),
-            Arg.Any<string>(), Arg.Any<string>(),
+            Arg.Any<string>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
-            Arg.Any<string?>(), Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
             Arg.Any<CancellationToken>())
             .ThrowsAsync(new RequestFailedException((int)HttpStatusCode.NotFound, "Not found"));
 
@@ -94,10 +98,12 @@ public class RestoreTriggerCommandTests
     {
         _backupService.TriggerRestoreAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(),
-            Arg.Any<string>(), Arg.Any<string>(),
+            Arg.Any<string>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
-            Arg.Any<string?>(), Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
             Arg.Any<CancellationToken>())
             .ThrowsAsync(new Exception("Test error"));
 
@@ -125,10 +131,12 @@ public class RestoreTriggerCommandTests
 
         _backupService.TriggerRestoreAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(),
-            Arg.Any<string>(), Arg.Any<string>(),
+            Arg.Any<string>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
-            Arg.Any<string?>(), Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
             Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(expectedResult));
 
@@ -140,7 +148,53 @@ public class RestoreTriggerCommandTests
             "vault1", "rg1", "sub123", "item1", "rp1",
             Arg.Any<string?>(), Arg.Any<string?>(),
             Arg.Any<string?>(), Arg.Any<string?>(),
-            Arg.Any<string?>(), Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
             Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_TriggersRestore_WithPointInTime_Successfully()
+    {
+        var expectedResult = new RestoreTriggerResult("Accepted", "job789", "Restore triggered successfully");
+
+        _backupService.TriggerRestoreAsync(
+            Arg.Is("vault1"), Arg.Is("rg1"), Arg.Is("sub123"),
+            Arg.Is("item1"), Arg.Is<string?>(x => x == null),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(), Arg.Any<string?>(),
+            Arg.Any<string?>(), Arg.Is("2025-01-15T10:30:00Z"),
+            Arg.Any<string?>(),
+            Arg.Any<RetryPolicyOptions?>(),
+            Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(expectedResult));
+
+        var args = _commandDefinition.Parse(["--subscription", "sub123", "--resource-group", "rg1", "--vault", "vault1", "--protected-item", "item1", "--point-in-time", "2025-01-15T10:30:00Z"]);
+
+        var response = await _command.ExecuteAsync(_context, args, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(response);
+        Assert.Equal(HttpStatusCode.OK, response.Status);
+        Assert.NotNull(response.Results);
+
+        var json = JsonSerializer.Serialize(response.Results);
+        var result = JsonSerializer.Deserialize(json, AzureBackupJsonContext.Default.RestoreTriggerCommandResult);
+
+        Assert.NotNull(result);
+        Assert.Equal("Accepted", result.Result.Status);
+        Assert.Equal("job789", result.Result.JobId);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_FailsWithoutRecoveryPointOrPointInTime()
+    {
+        var args = _commandDefinition.Parse(["--subscription", "sub123", "--resource-group", "rg1", "--vault", "vault1", "--protected-item", "item1"]);
+
+        var response = await _command.ExecuteAsync(_context, args, TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.Status);
+        Assert.Contains("--recovery-point", response.Message);
+        Assert.Contains("--point-in-time", response.Message);
     }
 }

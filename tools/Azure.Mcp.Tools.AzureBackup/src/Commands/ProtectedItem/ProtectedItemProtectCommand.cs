@@ -48,6 +48,7 @@ public sealed class ProtectedItemProtectCommand(ILogger<ProtectedItemProtectComm
         var options = base.BindOptions(parseResult);
         options.DatasourceId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.DatasourceId.Name);
         options.Policy = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.Policy.Name);
+        options.Container = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.Container.Name);
         options.DatasourceType = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.DatasourceType.Name);
         return options;
     }
@@ -71,7 +72,7 @@ public sealed class ProtectedItemProtectCommand(ILogger<ProtectedItemProtectComm
                 options.DatasourceId!,
                 options.Policy!,
                 options.VaultType,
-                null,
+                options.Container,
                 options.DatasourceType,
                 options.Tenant,
                 options.RetryPolicy,

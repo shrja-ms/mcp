@@ -3,18 +3,12 @@
 
 using System.Text.Json.Serialization;
 
-namespace Azure.Mcp.Tools.AzureBackup.Options.ProtectedItem;
+namespace Azure.Mcp.Tools.AzureBackup.Options.Container;
 
-public class ProtectedItemAutoProtectOptions : BaseAzureBackupOptions
+public class ContainerRegisterOptions : BaseAzureBackupOptions
 {
     [JsonPropertyName(AzureBackupOptionDefinitions.VmResourceIdName)]
     public string? VmResourceId { get; set; }
-
-    [JsonPropertyName(AzureBackupOptionDefinitions.InstanceNameName)]
-    public string? InstanceName { get; set; }
-
-    [JsonPropertyName(AzureBackupOptionDefinitions.PolicyName)]
-    public string? Policy { get; set; }
 
     [JsonPropertyName(AzureBackupOptionDefinitions.WorkloadTypeName)]
     public string? WorkloadType { get; set; }

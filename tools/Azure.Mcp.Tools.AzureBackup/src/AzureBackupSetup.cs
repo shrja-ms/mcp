@@ -3,6 +3,7 @@
 
 using Azure.Mcp.Tools.AzureBackup.Commands.Backup;
 using Azure.Mcp.Tools.AzureBackup.Commands.Bulk;
+using Azure.Mcp.Tools.AzureBackup.Commands.Container;
 using Azure.Mcp.Tools.AzureBackup.Commands.Cost;
 using Azure.Mcp.Tools.AzureBackup.Commands.Diagnostics;
 using Azure.Mcp.Tools.AzureBackup.Commands.Dr;
@@ -11,6 +12,7 @@ using Azure.Mcp.Tools.AzureBackup.Commands.Iac;
 using Azure.Mcp.Tools.AzureBackup.Commands.Job;
 using Azure.Mcp.Tools.AzureBackup.Commands.Monitoring;
 using Azure.Mcp.Tools.AzureBackup.Commands.Policy;
+using Azure.Mcp.Tools.AzureBackup.Commands.ProtectableItem;
 using Azure.Mcp.Tools.AzureBackup.Commands.ProtectedItem;
 using Azure.Mcp.Tools.AzureBackup.Commands.RecoveryPoint;
 using Azure.Mcp.Tools.AzureBackup.Commands.Restore;
@@ -63,6 +65,13 @@ public class AzureBackupSetup : IAreaSetup
         // Backup
         services.AddSingleton<BackupTriggerCommand>();
         services.AddSingleton<BackupStatusCommand>();
+
+        // Container
+        services.AddSingleton<ContainerRegisterCommand>();
+        services.AddSingleton<ContainerInquiryCommand>();
+
+        // Protectable item
+        services.AddSingleton<ProtectableItemListCommand>();
 
         // Restore
         services.AddSingleton<RestoreTriggerCommand>();
@@ -168,6 +177,17 @@ public class AzureBackupSetup : IAreaSetup
         RegisterCommand<ProtectedItemModifyCommand>(serviceProvider, protectedItem);
         RegisterCommand<ProtectedItemUndeleteCommand>(serviceProvider, protectedItem);
         RegisterCommand<ProtectedItemAutoProtectCommand>(serviceProvider, protectedItem);
+
+        // Container subgroup (SQL/HANA workload registration and inquiry)
+        var container = new CommandGroup("container", "Container operations - Register VMs and trigger database discovery for SQL/HANA workloads.");
+        azureBackup.AddSubGroup(container);
+        RegisterCommand<ContainerRegisterCommand>(serviceProvider, container);
+        RegisterCommand<ContainerInquiryCommand>(serviceProvider, container);
+
+        // Protectable item subgroup (discovered databases available for protection)
+        var protectableItem = new CommandGroup("protectableitem", "Protectable item operations - List discovered databases available for protection.");
+        azureBackup.AddSubGroup(protectableItem);
+        RegisterCommand<ProtectableItemListCommand>(serviceProvider, protectableItem);
 
         // Backup subgroup
         var backup = new CommandGroup("backup", "Backup operations - Trigger on-demand backups and check backup status.");

@@ -11,6 +11,7 @@ using Azure.Mcp.Tools.AzureBackup.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Mcp.Core.Commands;
 using Microsoft.Mcp.Core.Models.Command;
+using Microsoft.Mcp.Core.Models.Option;
 
 namespace Azure.Mcp.Tools.AzureBackup.Commands.Restore;
 
@@ -23,7 +24,9 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
     public override string Name => "trigger";
     public override string Description =>
         """
-        Triggers a restore operation for a protected item or backup instance from a specified recovery point.
+        Triggers a restore operation for a protected item or backup instance.
+        Use --recovery-point for discrete recovery point restore (Disk, PGFlex, AKS, IaaS VM).
+        Use --point-in-time for continuous/PIT restore (Blob vaulted backup).
         The operation is asynchronous; use 'azurebackup job get' to monitor the restore job progress.
         Optionally specify a target resource ID for alternate-location restore.
         """;
@@ -37,17 +40,21 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
     protected override void RegisterOptions(Command command)
     {
         base.RegisterOptions(command);
-        command.Options.Add(AzureBackupOptionDefinitions.RecoveryPoint);
+        command.Options.Add(AzureBackupOptionDefinitions.RecoveryPoint.AsOptional());
+        command.Options.Add(AzureBackupOptionDefinitions.PointInTime);
         command.Options.Add(AzureBackupOptionDefinitions.TargetResourceId);
         command.Options.Add(AzureBackupOptionDefinitions.RestoreLocation);
+        command.Options.Add(AzureBackupOptionDefinitions.StagingStorageAccountId);
     }
 
     protected override RestoreTriggerOptions BindOptions(ParseResult parseResult)
     {
         var options = base.BindOptions(parseResult);
         options.RecoveryPoint = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.RecoveryPoint.Name);
+        options.PointInTime = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.PointInTime.Name);
         options.TargetResourceId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetResourceId.Name);
         options.RestoreLocation = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.RestoreLocation.Name);
+        options.StagingStorageAccountId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.StagingStorageAccountId.Name);
         return options;
     }
 
@@ -62,17 +69,24 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
 
         try
         {
+            if (string.IsNullOrEmpty(options.RecoveryPoint) && string.IsNullOrEmpty(options.PointInTime))
+            {
+                throw new ArgumentException("Either --recovery-point or --point-in-time must be specified.");
+            }
+
             var service = context.GetService<IAzureBackupService>();
             var result = await service.TriggerRestoreAsync(
                 options.Vault!,
                 options.ResourceGroup!,
                 options.Subscription!,
                 options.ProtectedItem!,
-                options.RecoveryPoint!,
+                options.RecoveryPoint,
                 options.VaultType,
                 options.Container,
                 options.TargetResourceId,
                 options.RestoreLocation,
+                options.StagingStorageAccountId,
+                options.PointInTime,
                 options.Tenant,
                 options.RetryPolicy,
                 cancellationToken);

@@ -16,7 +16,7 @@ public interface IRsvBackupOperations
     Task<ProtectedItemInfo> GetProtectedItemAsync(string vaultName, string resourceGroup, string subscription, string protectedItemName, string? containerName, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<List<ProtectedItemInfo>> ListProtectedItemsAsync(string vaultName, string resourceGroup, string subscription, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<BackupTriggerResult> TriggerBackupAsync(string vaultName, string resourceGroup, string subscription, string protectedItemName, string? containerName, string? expiry, string? backupType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
-    Task<RestoreTriggerResult> TriggerRestoreAsync(string vaultName, string resourceGroup, string subscription, string protectedItemName, string recoveryPointId, string? containerName, string? targetResourceId, string? restoreLocation, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
+    Task<RestoreTriggerResult> TriggerRestoreAsync(string vaultName, string resourceGroup, string subscription, string protectedItemName, string recoveryPointId, string? containerName, string? targetResourceId, string? restoreLocation, string? stagingStorageAccountId, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<BackupPolicyInfo> GetPolicyAsync(string vaultName, string resourceGroup, string subscription, string policyName, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<List<BackupPolicyInfo>> ListPoliciesAsync(string vaultName, string resourceGroup, string subscription, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<BackupJobInfo> GetJobAsync(string vaultName, string resourceGroup, string subscription, string jobId, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
@@ -38,4 +38,10 @@ public interface IRsvBackupOperations
     Task<OperationResult> ConfigureSoftDeleteAsync(string vaultName, string resourceGroup, string subscription, string softDeleteState, string? softDeleteRetentionDays, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<OperationResult> ConfigureCrossRegionRestoreAsync(string vaultName, string resourceGroup, string subscription, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<HealthCheckResult> RunBackupHealthCheckAsync(string vaultName, string resourceGroup, string subscription, int? rpoThresholdHours, bool includeSecurityPosture, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
+
+    // Workload container operations (SQL/HANA in IaaS VM)
+    Task<OperationResult> RegisterContainerAsync(string vaultName, string resourceGroup, string subscription, string vmResourceId, string workloadType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
+    Task<OperationResult> TriggerInquiryAsync(string vaultName, string resourceGroup, string subscription, string containerName, string? workloadType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
+    Task<List<ProtectableItemInfo>> ListProtectableItemsAsync(string vaultName, string resourceGroup, string subscription, string? workloadType, string? containerName, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
+    Task<OperationResult> EnableAutoProtectionAsync(string vaultName, string resourceGroup, string subscription, string vmResourceId, string instanceName, string policyName, string workloadType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
 }

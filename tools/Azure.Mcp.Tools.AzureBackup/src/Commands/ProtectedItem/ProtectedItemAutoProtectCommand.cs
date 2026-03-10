@@ -2,9 +2,7 @@
 // Licensed under the MIT License.
 
 using System.Text.Json.Serialization;
-using Azure.Mcp.Core.Commands.Subscription;
 using Azure.Mcp.Core.Extensions;
-using Azure.Mcp.Core.Models.Option;
 using Azure.Mcp.Tools.AzureBackup.Models;
 using Azure.Mcp.Tools.AzureBackup.Options;
 using Azure.Mcp.Tools.AzureBackup.Options.ProtectedItem;
@@ -16,7 +14,7 @@ using Microsoft.Mcp.Core.Models.Option;
 
 namespace Azure.Mcp.Tools.AzureBackup.Commands.ProtectedItem;
 
-public sealed class ProtectedItemAutoProtectCommand(ILogger<ProtectedItemAutoProtectCommand> logger) : SubscriptionCommand<ProtectedItemAutoProtectOptions>()
+public sealed class ProtectedItemAutoProtectCommand(ILogger<ProtectedItemAutoProtectCommand> logger) : BaseAzureBackupCommand<ProtectedItemAutoProtectOptions>()
 {
     private const string CommandTitle = "Enable Auto-Protection";
     private readonly ILogger<ProtectedItemAutoProtectCommand> _logger = logger;
@@ -30,7 +28,6 @@ public sealed class ProtectedItemAutoProtectCommand(ILogger<ProtectedItemAutoPro
     protected override void RegisterOptions(Command command)
     {
         base.RegisterOptions(command);
-        command.Options.Add(AzureBackupOptionDefinitions.Vault);
         command.Options.Add(AzureBackupOptionDefinitions.VmResourceId);
         command.Options.Add(AzureBackupOptionDefinitions.InstanceName);
         command.Options.Add(AzureBackupOptionDefinitions.Policy);
@@ -40,7 +37,6 @@ public sealed class ProtectedItemAutoProtectCommand(ILogger<ProtectedItemAutoPro
     protected override ProtectedItemAutoProtectOptions BindOptions(ParseResult parseResult)
     {
         var options = base.BindOptions(parseResult);
-        options.Vault = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.Vault.Name);
         options.VmResourceId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.VmResourceId.Name);
         options.InstanceName = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.InstanceName.Name);
         options.Policy = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.Policy.Name);

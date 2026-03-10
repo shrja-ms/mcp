@@ -117,15 +117,16 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
 
     public async Task<RestoreTriggerResult> TriggerRestoreAsync(
         string vaultName, string resourceGroup, string subscription,
-        string protectedItemName, string recoveryPointId, string? vaultType,
+        string protectedItemName, string? recoveryPointId, string? vaultType,
         string? containerName, string? targetResourceId, string? restoreLocation,
+        string? stagingStorageAccountId, string? pointInTime,
         string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         var resolvedType = await ResolveVaultTypeAsync(vaultName, resourceGroup, subscription, vaultType, tenant, retryPolicy, cancellationToken);
 
         return VaultTypeResolver.IsRsv(resolvedType)
-            ? await rsvOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId, containerName, targetResourceId, restoreLocation, tenant, retryPolicy, cancellationToken)
-            : await dppOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId, targetResourceId, restoreLocation, tenant, retryPolicy, cancellationToken);
+            ? await rsvOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId ?? string.Empty, containerName, targetResourceId, restoreLocation, stagingStorageAccountId, tenant, retryPolicy, cancellationToken)
+            : await dppOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId, targetResourceId, restoreLocation, pointInTime, tenant, retryPolicy, cancellationToken);
     }
 
     public async Task<BackupPolicyInfo> GetPolicyAsync(
@@ -320,7 +321,34 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
         RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         // Auto-protection is an RSV-only feature for SQL/HANA workloads
-        return Task.FromResult(new OperationResult("Accepted", null, $"Auto-protection enabled for {workloadType} on VM '{vmResourceId}' with policy '{policyName}'."));
+        return rsvOps.EnableAutoProtectionAsync(vaultName, resourceGroup, subscription, vmResourceId, instanceName, policyName, workloadType, tenant, retryPolicy, cancellationToken);
+    }
+
+    public Task<OperationResult> RegisterContainerAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string vmResourceId, string workloadType, string? vaultType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        // Container registration is an RSV-only feature for SQL/HANA workloads
+        return rsvOps.RegisterContainerAsync(vaultName, resourceGroup, subscription, vmResourceId, workloadType, tenant, retryPolicy, cancellationToken);
+    }
+
+    public Task<OperationResult> TriggerInquiryAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string containerName, string? workloadType, string? vaultType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        // Inquiry is an RSV-only feature for SQL/HANA workloads
+        return rsvOps.TriggerInquiryAsync(vaultName, resourceGroup, subscription, containerName, workloadType, tenant, retryPolicy, cancellationToken);
+    }
+
+    public Task<List<ProtectableItemInfo>> ListProtectableItemsAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? workloadType, string? containerName, string? vaultType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        // Protectable items listing is an RSV-only feature for SQL/HANA workloads
+        return rsvOps.ListProtectableItemsAsync(vaultName, resourceGroup, subscription, workloadType, containerName, tenant, retryPolicy, cancellationToken);
     }
 
     public Task<BackupStatusResult> GetBackupStatusAsync(

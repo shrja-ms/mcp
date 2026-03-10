@@ -114,6 +114,41 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vault = await vaultResource.GetAsync(cancellationToken: cancellationToken);
         var vaultLocation = vault.Value.Data.Location;
 
+        var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, policyName);
+
+        // Check if this is a workload (SQL/HANA) protection request
+        if (IsWorkloadType(datasourceType))
+        {
+            // For workload protection, containerName and datasourceId (protectable item name) are required
+            if (string.IsNullOrEmpty(containerName))
+            {
+                throw new ArgumentException("The --container parameter is required for SQL/HANA workload protection. Use 'azurebackup protectable_item_list' to discover containers and items.");
+            }
+
+            var protectedItemName = datasourceId; // For workloads, datasourceId is the protectable item name
+            var protectedItemId = BackupProtectedItemResource.CreateResourceIdentifier(
+                subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+
+            BackupGenericProtectedItem protectedItemProperties = datasourceType?.ToUpperInvariant() switch
+            {
+                "SQLDATABASE" or "MSSQL" => new VmWorkloadSqlDatabaseProtectedItem { PolicyId = policyArmId },
+                "SAPHANA" or "SAPHANADATABASE" => new VmWorkloadSapHanaDatabaseProtectedItem { PolicyId = policyArmId },
+                _ => new VmWorkloadSqlDatabaseProtectedItem { PolicyId = policyArmId }
+            };
+
+            var protectedItemData = new BackupProtectedItemData(vaultLocation) { Properties = protectedItemProperties };
+            var protectedItemResource = armClient.GetBackupProtectedItemResource(protectedItemId);
+            var result = await protectedItemResource.UpdateAsync(WaitUntil.Started, protectedItemData, cancellationToken);
+
+            var jobId = await FindLatestJobIdAsync(armClient, subscription, resourceGroup, vaultName, "ConfigureBackup", cancellationToken);
+            jobId ??= ExtractOperationIdFromResponse(result.GetRawResponse());
+
+            return new ProtectResult("Accepted", protectedItemName, jobId,
+                jobId != null ? $"Workload protection initiated. Use 'azurebackup job get --job {jobId}' to monitor progress." : "Workload protection initiated.");
+        }
+
+        // Standard VM protection flow
         // Trigger container discovery/refresh so the vault discovers the VM
         var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
         var rgResource = armClient.GetResourceGroupResource(rgId);
@@ -124,15 +159,12 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         // Derive container name if not provided
         var container = containerName ?? RsvNamingHelper.DeriveContainerName(datasourceId);
-        var protectedItemName = RsvNamingHelper.DeriveProtectedItemName(datasourceId);
+        var vmProtectedItemName = RsvNamingHelper.DeriveProtectedItemName(datasourceId);
 
-        var protectedItemId = BackupProtectedItemResource.CreateResourceIdentifier(
-            subscription, resourceGroup, vaultName, FabricName, container, protectedItemName);
+        var vmProtectedItemId = BackupProtectedItemResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, container, vmProtectedItemName);
 
-        var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(
-            subscription, resourceGroup, vaultName, policyName);
-
-        var protectedItemData = new BackupProtectedItemData(vaultLocation)
+        var vmProtectedItemData = new BackupProtectedItemData(vaultLocation)
         {
             Properties = new IaasComputeVmProtectedItem
             {
@@ -141,16 +173,19 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             }
         };
 
-        var protectedItemResource = armClient.GetBackupProtectedItemResource(protectedItemId);
-        var result = await protectedItemResource.UpdateAsync(WaitUntil.Started, protectedItemData, cancellationToken);
+        var vmProtectedItemResource = armClient.GetBackupProtectedItemResource(vmProtectedItemId);
+        var vmResult = await vmProtectedItemResource.UpdateAsync(WaitUntil.Started, vmProtectedItemData, cancellationToken);
 
-        var jobId = ExtractJobIdFromResponse(result.GetRawResponse());
+        // The Azure-AsyncOperation header contains an operation ID, not a job ID.
+        // We need to find the actual job by listing recent jobs.
+        var vmJobId = await FindLatestJobIdAsync(armClient, subscription, resourceGroup, vaultName, "ConfigureBackup", cancellationToken);
+        vmJobId ??= ExtractOperationIdFromResponse(vmResult.GetRawResponse()); // Fallback to operation ID
 
         return new ProtectResult(
             "Accepted",
-            protectedItemName,
-            jobId,
-            jobId != null ? $"Protection initiated. Use 'azurebackup job get --job {jobId}' to monitor progress." : "Protection initiated.");
+            vmProtectedItemName,
+            vmJobId,
+            vmJobId != null ? $"Protection initiated. Use 'azurebackup job get --job {vmJobId}' to monitor progress." : "Protection initiated.");
     }
 
     public async Task<ProtectedItemInfo> GetProtectedItemAsync(
@@ -233,11 +268,15 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         var backupContent = new TriggerBackupContent(new AzureLocation(string.Empty))
         {
-            Properties = CreateBackupRequestContent(backupType, expiryTime)
+            Properties = CreateBackupRequestContent(backupType, expiryTime, protectedItemName, containerName)
         };
 
         var result = await itemResource.TriggerBackupAsync(backupContent, cancellationToken);
-        var jobId = ExtractJobIdFromResponse(result);
+
+        // The Azure-AsyncOperation header contains an operation ID, not a job ID.
+        // We need to find the actual backup job by listing recent jobs.
+        var jobId = await FindLatestJobIdAsync(armClient, subscription, resourceGroup, vaultName, "Backup", cancellationToken);
+        jobId ??= ExtractOperationIdFromResponse(result); // Fallback to operation ID if job not found yet
 
         return new BackupTriggerResult(
             "Accepted",
@@ -245,11 +284,38 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             jobId != null ? $"Backup triggered. Use 'azurebackup job get --job {jobId}' to monitor progress." : "Backup triggered.");
     }
 
-    private static BackupContent CreateBackupRequestContent(string? backupType, DateTimeOffset? expiryTime)
+    private static BackupContent CreateBackupRequestContent(string? backupType, DateTimeOffset? expiryTime, string? protectedItemName = null, string? containerName = null)
     {
-        // IaasVmBackupContent is used for RSV workloads. The backupType parameter
-        // is informational for RSV (defaults to full); it is primarily used for DPP (Backup vault) scenarios.
-        _ = backupType; // Reserved for future RSV backup type support
+        // If a specific backup type is provided (Full, Differential, Log), use workload backup content
+        if (!string.IsNullOrEmpty(backupType) && !backupType.Equals("Default", StringComparison.OrdinalIgnoreCase))
+        {
+            return new WorkloadBackupContent
+            {
+                BackupType = new BackupType(backupType),
+                RecoveryPointExpireOn = expiryTime,
+                EnableCompression = true
+            };
+        }
+
+        // Auto-detect workload type from item/container naming conventions
+        var isWorkload = (protectedItemName != null && (
+            protectedItemName.StartsWith("sqldatabase;", StringComparison.OrdinalIgnoreCase) ||
+            protectedItemName.StartsWith("sqlinstance;", StringComparison.OrdinalIgnoreCase) ||
+            protectedItemName.StartsWith("saphanadatabase;", StringComparison.OrdinalIgnoreCase) ||
+            protectedItemName.StartsWith("saphanainstance;", StringComparison.OrdinalIgnoreCase))) ||
+            (containerName != null && containerName.StartsWith("VMAppContainer", StringComparison.OrdinalIgnoreCase));
+
+        if (isWorkload)
+        {
+            return new WorkloadBackupContent
+            {
+                BackupType = new BackupType("Full"),
+                RecoveryPointExpireOn = expiryTime,
+                EnableCompression = true
+            };
+        }
+
+        // Default: IaasVmBackupContent for VM workloads
         return new IaasVmBackupContent
         {
             RecoveryPointExpireOn = expiryTime
@@ -259,8 +325,8 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
     public async Task<RestoreTriggerResult> TriggerRestoreAsync(
         string vaultName, string resourceGroup, string subscription,
         string protectedItemName, string recoveryPointId, string? containerName,
-        string? targetResourceId, string? restoreLocation, string? tenant,
-        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+        string? targetResourceId, string? restoreLocation, string? stagingStorageAccountId,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         ValidateRequiredParameters(
             (nameof(vaultName), vaultName),
@@ -275,29 +341,76 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         }
 
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        // Get the existing protected item to determine type and extract SourceResourceId
+        var piId = BackupProtectedItemResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
+        var piResource = armClient.GetBackupProtectedItemResource(piId);
+        var existingItem = await piResource.GetAsync(cancellationToken: cancellationToken);
+        var existingProperties = existingItem.Value.Data.Properties;
+
+        // Get vault location for restore region
+        var vaultRes = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultRes);
+        var vault = await vaultResource.GetAsync(cancellationToken);
+        var vaultLocation = restoreLocation ?? vault.Value.Data.Location.ToString();
+
         var rpResourceId = BackupRecoveryPointResource.CreateResourceIdentifier(
             subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName, recoveryPointId);
         var rpResource = armClient.GetBackupRecoveryPointResource(rpResourceId);
 
-        var restoreProperties = new IaasVmRestoreContent
-        {
-            RecoveryPointId = recoveryPointId,
-            RecoveryType = FileShareRecoveryType.OriginalLocation
-        };
+        RestoreContent restoreProperties;
 
-        if (!string.IsNullOrEmpty(targetResourceId))
+        // Check if this is a workload (SQL/HANA) protected item
+        if (existingProperties is VmWorkloadSqlDatabaseProtectedItem)
         {
-            restoreProperties.RecoveryType = FileShareRecoveryType.AlternateLocation;
-            restoreProperties.TargetResourceGroupId = new ResourceIdentifier(targetResourceId);
+            restoreProperties = CreateWorkloadSqlRestoreContent(targetResourceId, containerName, protectedItemName);
+        }
+        else if (existingProperties is VmWorkloadSapHanaDatabaseProtectedItem)
+        {
+            restoreProperties = CreateWorkloadSapHanaRestoreContent(targetResourceId, containerName, protectedItemName);
+        }
+        else
+        {
+            // Standard VM restore
+            var sourceResourceId = (existingProperties as IaasComputeVmProtectedItem)?.SourceResourceId
+                ?? (existingProperties as BackupGenericProtectedItem)?.SourceResourceId;
+
+            var vmRestoreContent = new IaasVmRestoreContent
+            {
+                RecoveryPointId = recoveryPointId,
+                RecoveryType = FileShareRecoveryType.OriginalLocation,
+                SourceResourceId = sourceResourceId,
+                Region = new AzureLocation(vaultLocation),
+                OriginalStorageAccountOption = true,
+                DoesCreateNewCloudService = false
+            };
+
+            if (!string.IsNullOrEmpty(stagingStorageAccountId))
+            {
+                vmRestoreContent.StorageAccountId = new ResourceIdentifier(stagingStorageAccountId);
+            }
+
+            if (!string.IsNullOrEmpty(targetResourceId))
+            {
+                vmRestoreContent.RecoveryType = FileShareRecoveryType.AlternateLocation;
+                vmRestoreContent.TargetResourceGroupId = new ResourceIdentifier(targetResourceId);
+                vmRestoreContent.OriginalStorageAccountOption = false;
+            }
+
+            restoreProperties = vmRestoreContent;
         }
 
-        var restoreContent = new TriggerRestoreContent(new AzureLocation(string.Empty))
+        var restoreContent = new TriggerRestoreContent(new AzureLocation(vaultLocation))
         {
             Properties = restoreProperties
         };
 
         var result = await rpResource.TriggerRestoreAsync(WaitUntil.Started, restoreContent, cancellationToken);
-        var jobId = ExtractJobIdFromResponse(result.GetRawResponse());
+
+        // The Azure-AsyncOperation header contains an operation ID, not a job ID.
+        var jobId = await FindLatestJobIdAsync(armClient, subscription, resourceGroup, vaultName, "Restore", cancellationToken);
+        jobId ??= ExtractOperationIdFromResponse(result.GetRawResponse()); // Fallback to operation ID
 
         return new RestoreTriggerResult(
             "Accepted",
@@ -522,15 +635,78 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var policyCollection = rgResource.GetBackupProtectionPolicies(vaultName);
 
         var retentionDays = int.TryParse(dailyRetentionDays, out var dd) ? dd : 30;
-        var dailyRetention = new DailyRetentionSchedule { RetentionDuration = new RetentionDuration { Count = retentionDays, DurationType = RetentionDurationType.Days } };
+
+        // Parse schedule time or default to 2:00 AM UTC
+        var scheduleDateTime = DateTimeOffset.TryParse(scheduleTime, out var st) ? st : new DateTimeOffset(DateTime.UtcNow.Date.AddHours(2), TimeSpan.Zero);
+        var scheduleRunTime = new DateTimeOffset(scheduleDateTime.Year, scheduleDateTime.Month, scheduleDateTime.Day,
+            scheduleDateTime.Hour, scheduleDateTime.Minute, 0, TimeSpan.Zero);
+
+        BackupGenericProtectionPolicy policyProperties;
+
+        if (IsWorkloadType(workloadType))
+        {
+            // SQL/HANA workload policy
+            var fullSchedule = new SimpleSchedulePolicy { ScheduleRunFrequency = ScheduleRunType.Daily };
+            fullSchedule.ScheduleRunTimes.Add(scheduleRunTime);
+
+            var fullRetention = new DailyRetentionSchedule { RetentionDuration = new RetentionDuration { Count = retentionDays, DurationType = RetentionDurationType.Days } };
+            fullRetention.RetentionTimes.Add(scheduleRunTime);
+
+            var fullSubPolicy = new SubProtectionPolicy
+            {
+                PolicyType = new SubProtectionPolicyType("Full"),
+                SchedulePolicy = fullSchedule,
+                RetentionPolicy = new LongTermRetentionPolicy { DailySchedule = fullRetention }
+            };
+
+            var logRetention = new DailyRetentionSchedule { RetentionDuration = new RetentionDuration { Count = 15, DurationType = RetentionDurationType.Days } };
+
+            var logSubPolicy = new SubProtectionPolicy
+            {
+                PolicyType = new SubProtectionPolicyType("Log"),
+                SchedulePolicy = new LogSchedulePolicy { ScheduleFrequencyInMins = 60 },
+                RetentionPolicy = new SimpleRetentionPolicy { RetentionDuration = new RetentionDuration { Count = 15, DurationType = RetentionDurationType.Days } }
+            };
+
+            var wlPolicy = new VmWorkloadProtectionPolicy
+            {
+                WorkLoadType = new BackupWorkloadType(workloadType.ToUpperInvariant() switch
+                {
+                    "SQLDATABASE" or "MSSQL" => "SQLDataBase",
+                    "SAPHANA" or "SAPHANADATABASE" => "SAPHanaDatabase",
+                    _ => "SQLDataBase"
+                }),
+                Settings = new BackupCommonSettings
+                {
+                    TimeZone = "UTC",
+                    IsCompression = false,
+                    IsSqlCompression = false
+                }
+            };
+            wlPolicy.SubProtectionPolicy.Add(fullSubPolicy);
+            wlPolicy.SubProtectionPolicy.Add(logSubPolicy);
+
+            policyProperties = wlPolicy;
+        }
+        else
+        {
+            // Standard VM policy
+            var schedulePolicy = new SimpleSchedulePolicy { ScheduleRunFrequency = ScheduleRunType.Daily };
+            schedulePolicy.ScheduleRunTimes.Add(scheduleRunTime);
+
+            var dailyRetention = new DailyRetentionSchedule { RetentionDuration = new RetentionDuration { Count = retentionDays, DurationType = RetentionDurationType.Days } };
+            dailyRetention.RetentionTimes.Add(scheduleRunTime);
+
+            policyProperties = new IaasVmProtectionPolicy
+            {
+                SchedulePolicy = schedulePolicy,
+                RetentionPolicy = new LongTermRetentionPolicy { DailySchedule = dailyRetention }
+            };
+        }
 
         var policyData = new BackupProtectionPolicyData(vaultLocation)
         {
-            Properties = new IaasVmProtectionPolicy
-            {
-                SchedulePolicy = new SimpleSchedulePolicy { ScheduleRunFrequency = ScheduleRunType.Daily },
-                RetentionPolicy = new LongTermRetentionPolicy { DailySchedule = dailyRetention }
-            }
+            Properties = policyProperties
         };
 
         await policyCollection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);
@@ -593,10 +769,16 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
         var piResource = armClient.GetBackupProtectedItemResource(piId);
 
-        var data = new BackupProtectedItemData(vault.Value.Data.Location)
+        // Get existing item to determine type
+        var existingItem = await piResource.GetAsync(cancellationToken: cancellationToken);
+        BackupGenericProtectedItem stopProps = existingItem.Value.Data.Properties switch
         {
-            Properties = new IaasComputeVmProtectedItem { ProtectionState = BackupProtectionState.ProtectionStopped }
+            VmWorkloadSqlDatabaseProtectedItem => new VmWorkloadSqlDatabaseProtectedItem { ProtectionState = BackupProtectionState.ProtectionStopped },
+            VmWorkloadSapHanaDatabaseProtectedItem => new VmWorkloadSapHanaDatabaseProtectedItem { ProtectionState = BackupProtectionState.ProtectionStopped },
+            _ => new IaasComputeVmProtectedItem { ProtectionState = BackupProtectionState.ProtectionStopped }
         };
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = stopProps };
 
         await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
         return new OperationResult("Accepted", null, "Protection stopped with data retained.");
@@ -627,14 +809,22 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
         var piResource = armClient.GetBackupProtectedItemResource(piId);
 
-        var props = new IaasComputeVmProtectedItem();
+        // Get existing item to determine type
+        var existingItem = await piResource.GetAsync(cancellationToken: cancellationToken);
+        ResourceIdentifier? policyArmId = null;
         if (!string.IsNullOrEmpty(policyName))
         {
-            var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
-            props.PolicyId = policyArmId;
+            policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
         }
 
-        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = props };
+        BackupGenericProtectedItem resumeProps = existingItem.Value.Data.Properties switch
+        {
+            VmWorkloadSqlDatabaseProtectedItem => new VmWorkloadSqlDatabaseProtectedItem { PolicyId = policyArmId },
+            VmWorkloadSapHanaDatabaseProtectedItem => new VmWorkloadSapHanaDatabaseProtectedItem { PolicyId = policyArmId },
+            _ => new IaasComputeVmProtectedItem { PolicyId = policyArmId }
+        };
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = resumeProps };
         await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
 
         return new OperationResult("Accepted", null, "Protection resumed.");
@@ -665,14 +855,48 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
         var piResource = armClient.GetBackupProtectedItemResource(piId);
 
-        var props = new IaasComputeVmProtectedItem();
+        // Get existing protected item to determine type and extract SourceResourceId
+        var existingItem = await piResource.GetAsync(cancellationToken: cancellationToken);
+        var existingProperties = existingItem.Value.Data.Properties;
+
+        ResourceIdentifier? policyArmId = null;
         if (!string.IsNullOrEmpty(newPolicyName))
         {
-            var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, newPolicyName);
-            props.PolicyId = policyArmId;
+            policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, newPolicyName);
         }
 
-        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = props };
+        BackupGenericProtectedItem modifyProps;
+        if (existingProperties is VmWorkloadSqlDatabaseProtectedItem)
+        {
+            modifyProps = new VmWorkloadSqlDatabaseProtectedItem { PolicyId = policyArmId };
+        }
+        else if (existingProperties is VmWorkloadSapHanaDatabaseProtectedItem)
+        {
+            modifyProps = new VmWorkloadSapHanaDatabaseProtectedItem { PolicyId = policyArmId };
+        }
+        else
+        {
+            var sourceResourceId = (existingProperties as IaasComputeVmProtectedItem)?.SourceResourceId
+                ?? (existingProperties as BackupGenericProtectedItem)?.SourceResourceId;
+
+            // If SourceResourceId not available from cast, derive from container name
+            if (sourceResourceId is null && !string.IsNullOrEmpty(containerName))
+            {
+                var parts = containerName.Split(';');
+                var vmName = parts[^1];
+                var vmRg = parts[^2];
+                sourceResourceId = new ResourceIdentifier(
+                    $"/subscriptions/{subscription}/resourceGroups/{vmRg}/providers/Microsoft.Compute/virtualMachines/{vmName}");
+            }
+
+            modifyProps = new IaasComputeVmProtectedItem
+            {
+                SourceResourceId = sourceResourceId,
+                PolicyId = policyArmId
+            };
+        }
+
+        var data = new BackupProtectedItemData(vault.Value.Data.Location) { Properties = modifyProps };
         await piResource.UpdateAsync(WaitUntil.Started, data, cancellationToken);
 
         return new OperationResult("Accepted", null, $"Protection modified. Policy changed to '{newPolicyName}'.");
@@ -720,10 +944,19 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
         var vault = await vaultResource.GetAsync(cancellationToken);
 
-        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location)
+        {
+            Properties = new RecoveryServicesVaultProperties
+            {
+                SecuritySettings = new RecoveryServicesSecuritySettings
+                {
+                    ImmutabilityState = new ImmutabilityState(immutabilityState)
+                }
+            }
+        };
         await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
 
-        return new OperationResult("Succeeded", null, $"Immutability set to '{immutabilityState}' for vault '{vaultName}'.");
+        return new OperationResult("Succeeded", null, $"Immutability set to '{immutabilityState}' for vault '{vaultName}'");
     }
 
     public async Task<OperationResult> ConfigureSoftDeleteAsync(
@@ -742,10 +975,29 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
         var vault = await vaultResource.GetAsync(cancellationToken);
 
-        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        var softDeleteSettings = new RecoveryServicesSoftDeleteSettings
+        {
+            SoftDeleteState = new RecoveryServicesSoftDeleteState(softDeleteState)
+        };
+
+        if (int.TryParse(softDeleteRetentionDays, out var retentionDays))
+        {
+            softDeleteSettings.SoftDeleteRetentionPeriodInDays = retentionDays;
+        }
+
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location)
+        {
+            Properties = new RecoveryServicesVaultProperties
+            {
+                SecuritySettings = new RecoveryServicesSecuritySettings
+                {
+                    SoftDeleteSettings = softDeleteSettings
+                }
+            }
+        };
         await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
 
-        return new OperationResult("Succeeded", null, $"Soft delete set to '{softDeleteState}' for vault '{vaultName}'.");
+        return new OperationResult("Succeeded", null, $"Soft delete set to '{softDeleteState}' for vault '{vaultName}'");
     }
 
     public async Task<OperationResult> ConfigureCrossRegionRestoreAsync(
@@ -762,7 +1014,14 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
         var vault = await vaultResource.GetAsync(cancellationToken);
 
-        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location);
+        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location)
+        {
+            Properties = new RecoveryServicesVaultProperties
+            {
+                RedundancySettings = ArmRecoveryServicesModelFactory.VaultPropertiesRedundancySettings(
+                    crossRegionRestore: CrossRegionRestore.Enabled)
+            }
+        };
         await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
 
         return new OperationResult("Succeeded", null, $"Cross-Region Restore enabled for vault '{vaultName}'.");
@@ -848,6 +1107,12 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
                 protectionStatus = vmItem.ProtectionState?.ToString();
                 lastBackupTime = vmItem.LastBackupOn;
             }
+            else if (genericItem is VmWorkloadProtectedItem workloadItem)
+            {
+                protectionStatus = workloadItem.ProtectionState?.ToString();
+                lastBackupTime = workloadItem.LastBackupOn;
+                datasourceType = workloadItem.WorkloadType?.ToString();
+            }
         }
 
         return new ProtectedItemInfo(
@@ -919,6 +1184,11 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             rpType = vmRp.RecoveryPointType;
             rpTime = vmRp.RecoveryPointOn;
         }
+        else if (data.Properties is WorkloadRecoveryPoint workloadRp)
+        {
+            rpType = workloadRp.RestorePointType?.ToString();
+            rpTime = workloadRp.RecoveryPointCreatedOn;
+        }
         else if (data.Properties is GenericRecoveryPoint genRp)
         {
             rpType = genRp.RecoveryPointType;
@@ -933,7 +1203,7 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             rpType);
     }
 
-    private static string? ExtractJobIdFromResponse(Response response)
+    private static string? ExtractOperationIdFromResponse(Response response)
     {
         if (response.Headers.TryGetValue("Azure-AsyncOperation", out var asyncOpUrl) && !string.IsNullOrEmpty(asyncOpUrl))
         {
@@ -944,24 +1214,338 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         return null;
     }
+
+    private static async Task<string?> FindLatestJobIdAsync(
+        ArmClient armClient, string subscription, string resourceGroup,
+        string vaultName, string operationType, CancellationToken cancellationToken)
+    {
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+        var jobCollection = rgResource.GetBackupJobs(vaultName);
+
+        // Look for the most recent job of the given operation type started within the last minute
+        await foreach (var job in jobCollection.GetAllAsync(cancellationToken: cancellationToken))
+        {
+            if (job.Data.Properties is BackupGenericJob genericJob)
+            {
+                if (genericJob.StartOn.HasValue &&
+                    genericJob.StartOn.Value > DateTimeOffset.UtcNow.AddMinutes(-2) &&
+                    string.Equals(genericJob.Operation, operationType, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(genericJob.Status, "InProgress", StringComparison.OrdinalIgnoreCase))
+                {
+                    return job.Data.Name;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsWorkloadType(string? datasourceType)
+    {
+        if (string.IsNullOrEmpty(datasourceType))
+        {
+            return false;
+        }
+
+        return datasourceType.ToUpperInvariant() switch
+        {
+            "SQLDATABASE" or "MSSQL" or "SQLDB" or "SQL" => true,
+            "SAPHANA" or "SAPHANADATABASE" or "SAPHANADB" => true,
+            _ => false
+        };
+    }
+
+    private static RestoreContent CreateWorkloadSqlRestoreContent(
+        string? targetResourceId, string containerName, string protectedItemName)
+    {
+        if (!string.IsNullOrEmpty(targetResourceId))
+        {
+            return new WorkloadSqlRestoreContent
+            {
+                RecoveryType = FileShareRecoveryType.AlternateLocation,
+                ShouldUseAlternateTargetLocation = true,
+                TargetInfo = new TargetRestoreInfo
+                {
+                    OverwriteOption = RestoreOverwriteOption.FailOnConflict,
+                    ContainerId = containerName,
+                    DatabaseName = protectedItemName
+                }
+            };
+        }
+
+        return new WorkloadSqlRestoreContent
+        {
+            RecoveryType = FileShareRecoveryType.OriginalLocation,
+            ShouldUseAlternateTargetLocation = false
+        };
+    }
+
+    private static RestoreContent CreateWorkloadSapHanaRestoreContent(
+        string? targetResourceId, string containerName, string protectedItemName)
+    {
+        if (!string.IsNullOrEmpty(targetResourceId))
+        {
+            return new WorkloadSapHanaRestoreContent
+            {
+                RecoveryType = FileShareRecoveryType.AlternateLocation,
+                TargetInfo = new TargetRestoreInfo
+                {
+                    OverwriteOption = RestoreOverwriteOption.FailOnConflict,
+                    ContainerId = containerName,
+                    DatabaseName = protectedItemName
+                }
+            };
+        }
+
+        return new WorkloadSapHanaRestoreContent
+        {
+            RecoveryType = FileShareRecoveryType.OriginalLocation
+        };
+    }
+
+    public async Task<OperationResult> RegisterContainerAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string vmResourceId, string workloadType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(vmResourceId), vmResourceId),
+            (nameof(workloadType), workloadType));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        var vmId = new ResourceIdentifier(vmResourceId);
+        var containerName = $"VMAppContainer;Compute;{vmId.ResourceGroupName};{vmId.Name}";
+
+        var containerId = BackupProtectionContainerResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName);
+
+        var containerResource = armClient.GetBackupProtectionContainerResource(containerId);
+
+        // Get vault location for the container data
+        var vaultResId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultResId);
+        var vault = await vaultResource.GetAsync(cancellationToken: cancellationToken);
+
+        var containerData = new BackupProtectionContainerData(vault.Value.Data.Location)
+        {
+            Properties = new VmAppContainerProtectionContainer
+            {
+                SourceResourceId = vmId,
+                BackupManagementType = BackupManagementType.AzureWorkload,
+                WorkloadType = new BackupWorkloadType(workloadType)
+            }
+        };
+
+        var result = await containerResource.UpdateAsync(WaitUntil.Started, containerData, cancellationToken);
+        var jobId = ExtractOperationIdFromResponse(result.GetRawResponse());
+
+        return new OperationResult(
+            "Accepted",
+            jobId,
+            $"Container registration initiated for VM '{vmId.Name}'. This may take several minutes. Use 'azurebackup job get --job {jobId}' to monitor progress.");
+    }
+
+    public async Task<OperationResult> TriggerInquiryAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string containerName, string? workloadType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(containerName), containerName));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        var containerId = BackupProtectionContainerResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, containerName);
+        var containerResource = armClient.GetBackupProtectionContainerResource(containerId);
+
+        string? filter = !string.IsNullOrEmpty(workloadType)
+            ? $"backupManagementType eq 'AzureWorkload' and workloadType eq '{workloadType}'"
+            : null;
+
+        var result = await containerResource.InquireAsync(filter, cancellationToken);
+        var operationId = ExtractOperationIdFromResponse(result);
+
+        return new OperationResult(
+            "Accepted",
+            operationId,
+            $"Inquiry triggered for container '{containerName}'. This discovers databases on the registered VM.");
+    }
+
+    public async Task<List<ProtectableItemInfo>> ListProtectableItemsAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? workloadType, string? containerName, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+
+        string? filter = null;
+        if (!string.IsNullOrEmpty(workloadType))
+        {
+            filter = $"backupManagementType eq 'AzureWorkload' and workloadType eq '{workloadType}'";
+        }
+
+        var items = new List<ProtectableItemInfo>();
+        await foreach (var item in rgResource.GetBackupProtectableItemsAsync(vaultName, filter: filter, cancellationToken: cancellationToken))
+        {
+            items.Add(MapToProtectableItemInfo(item));
+        }
+
+        return items;
+    }
+
+    public async Task<OperationResult> EnableAutoProtectionAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string vmResourceId, string instanceName, string policyName,
+        string workloadType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(vmResourceId), vmResourceId),
+            (nameof(instanceName), instanceName),
+            (nameof(policyName), policyName),
+            (nameof(workloadType), workloadType));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        var policyArmId = BackupProtectionPolicyResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, policyName);
+
+        var vmId = new ResourceIdentifier(vmResourceId);
+
+        // Intent name is a GUID as used by Azure Resource Manager
+        var intentName = Guid.NewGuid().ToString();
+
+        var intentId = BackupProtectionIntentResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, FabricName, intentName);
+        var intentResource = armClient.GetBackupProtectionIntentResource(intentId);
+
+        var vaultResId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultResId);
+        var vault = await vaultResource.GetAsync(cancellationToken: cancellationToken);
+
+        // Build container and protectable item references for the intent
+        var containerName = $"Compute;{vmId.ResourceGroupName};{vmId.Name}";
+        var itemId = $"/subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.RecoveryServices/vaults/{vaultName}/backupFabrics/Azure/protectionContainers/{containerName}/protectableItems/{instanceName}";
+        var sourceResourceId = $"/subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.RecoveryServices/vaults/{vaultName}/backupFabrics/Azure/protectionContainers/{containerName}";
+
+        var intentData = new BackupProtectionIntentData(vault.Value.Data.Location)
+        {
+            Properties = new RecoveryServiceVaultProtectionIntent
+            {
+                BackupManagementType = BackupManagementType.AzureWorkload,
+                ItemId = new ResourceIdentifier(itemId),
+                PolicyId = policyArmId,
+                SourceResourceId = new ResourceIdentifier(sourceResourceId)
+            }
+        };
+
+        await intentResource.UpdateAsync(WaitUntil.Started, intentData, cancellationToken);
+
+        return new OperationResult(
+            "Succeeded",
+            null,
+            $"Auto-protection enabled for '{instanceName}' on VM '{vmId.Name}' with policy '{policyName}'.");
+    }
+
+    private static ProtectableItemInfo MapToProtectableItemInfo(WorkloadProtectableItemResource data)
+    {
+        string? protectableItemType = null;
+        string? workloadType = null;
+        string? friendlyName = null;
+        string? serverName = null;
+        string? parentName = null;
+        string? protectionState = null;
+        string? containerName = null;
+
+        if (data.Properties is WorkloadProtectableItem workloadItem)
+        {
+            // ProtectableItemType is internal in the SDK, use type discrimination
+            protectableItemType = workloadItem switch
+            {
+                VmWorkloadSqlDatabaseProtectableItem => "SQLDataBase",
+                VmWorkloadSapHanaDatabaseProtectableItem => "SAPHanaDatabase",
+                VmWorkloadSqlInstanceProtectableItem => "SQLInstance",
+                VmWorkloadSapHanaSystemProtectableItem => "SAPHanaSystem",
+                _ => workloadItem.GetType().Name
+            };
+            workloadType = workloadItem.WorkloadType;
+            friendlyName = workloadItem.FriendlyName;
+            protectionState = workloadItem.ProtectionState?.ToString();
+
+            if (workloadItem is VmWorkloadSqlDatabaseProtectableItem sqlDb)
+            {
+                serverName = sqlDb.ServerName;
+                parentName = sqlDb.ParentName;
+            }
+            else if (workloadItem is VmWorkloadSapHanaDatabaseProtectableItem hanaDb)
+            {
+                serverName = hanaDb.ServerName;
+                parentName = hanaDb.ParentName;
+            }
+        }
+
+        return new ProtectableItemInfo(
+            data.Id?.ToString(),
+            data.Name,
+            protectableItemType,
+            workloadType,
+            friendlyName,
+            serverName,
+            parentName,
+            protectionState,
+            containerName);
+    }
 }
 
 internal static class RsvNamingHelper
 {
-    public static string DeriveContainerName(string datasourceId)
+    public static string DeriveContainerName(string datasourceId, string? datasourceType = null)
     {
-        var resourceId = new ResourceIdentifier(datasourceId);
-        var resourceType = resourceId.ResourceType.Type;
+        // For workload types, use VMAppContainer format
+        if (IsWorkloadDatasource(datasourceType))
+        {
+            var resourceId = new ResourceIdentifier(datasourceId);
+            return $"VMAppContainer;Compute;{resourceId.ResourceGroupName};{resourceId.Name}";
+        }
+
+        var vmResourceId = new ResourceIdentifier(datasourceId);
+        var resourceType = vmResourceId.ResourceType.Type;
 
         return resourceType.ToLowerInvariant() switch
         {
-            "virtualmachines" => $"IaasVMContainer;iaasvmcontainerv2;{resourceId.ResourceGroupName};{resourceId.Name}",
-            _ => $"GenericContainer;{resourceId.ResourceGroupName};{resourceId.Name}"
+            "virtualmachines" => $"IaasVMContainer;iaasvmcontainerv2;{vmResourceId.ResourceGroupName};{vmResourceId.Name}",
+            _ => $"GenericContainer;{vmResourceId.ResourceGroupName};{vmResourceId.Name}"
         };
     }
 
-    public static string DeriveProtectedItemName(string datasourceId)
+    public static string DeriveProtectedItemName(string datasourceId, string? datasourceType = null)
     {
+        // For workload types, the protectable item name is used directly (passed as datasourceId)
+        if (IsWorkloadDatasource(datasourceType))
+        {
+            return datasourceId;
+        }
+
         var resourceId = new ResourceIdentifier(datasourceId);
         var resourceType = resourceId.ResourceType.Type;
 
@@ -969,6 +1553,21 @@ internal static class RsvNamingHelper
         {
             "virtualmachines" => $"VM;iaasvmcontainerv2;{resourceId.ResourceGroupName};{resourceId.Name}",
             _ => $"GenericProtectedItem;{resourceId.ResourceGroupName};{resourceId.Name}"
+        };
+    }
+
+    private static bool IsWorkloadDatasource(string? datasourceType)
+    {
+        if (string.IsNullOrEmpty(datasourceType))
+        {
+            return false;
+        }
+
+        return datasourceType.ToUpperInvariant() switch
+        {
+            "SQLDATABASE" or "MSSQL" or "SQLDB" or "SQL" => true,
+            "SAPHANA" or "SAPHANADATABASE" or "SAPHANADB" => true,
+            _ => false
         };
     }
 }
