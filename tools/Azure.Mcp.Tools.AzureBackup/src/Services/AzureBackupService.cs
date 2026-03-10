@@ -120,12 +120,14 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
         string protectedItemName, string? recoveryPointId, string? vaultType,
         string? containerName, string? targetResourceId, string? restoreLocation,
         string? stagingStorageAccountId, string? pointInTime,
+        string? restoreMode, string? targetVmName, string? targetVnetId, string? targetSubnetId,
+        string? targetDatabaseName, string? targetInstanceName,
         string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         var resolvedType = await ResolveVaultTypeAsync(vaultName, resourceGroup, subscription, vaultType, tenant, retryPolicy, cancellationToken);
 
         return VaultTypeResolver.IsRsv(resolvedType)
-            ? await rsvOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId ?? string.Empty, containerName, targetResourceId, restoreLocation, stagingStorageAccountId, tenant, retryPolicy, cancellationToken)
+            ? await rsvOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId ?? string.Empty, containerName, targetResourceId, restoreLocation, stagingStorageAccountId, restoreMode, targetVmName, targetVnetId, targetSubnetId, targetDatabaseName, targetInstanceName, tenant, retryPolicy, cancellationToken)
             : await dppOps.TriggerRestoreAsync(vaultName, resourceGroup, subscription, protectedItemName, recoveryPointId, targetResourceId, restoreLocation, pointInTime, tenant, retryPolicy, cancellationToken);
     }
 

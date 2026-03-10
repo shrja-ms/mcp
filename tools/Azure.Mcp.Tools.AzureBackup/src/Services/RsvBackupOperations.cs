@@ -326,6 +326,8 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         string vaultName, string resourceGroup, string subscription,
         string protectedItemName, string recoveryPointId, string? containerName,
         string? targetResourceId, string? restoreLocation, string? stagingStorageAccountId,
+        string? restoreMode, string? targetVmName, string? targetVnetId, string? targetSubnetId,
+        string? targetDatabaseName, string? targetInstanceName,
         string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
         ValidateRequiredParameters(
@@ -364,7 +366,40 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         // Check if this is a workload (SQL/HANA) protected item
         if (existingProperties is VmWorkloadSqlDatabaseProtectedItem)
         {
-            restoreProperties = CreateWorkloadSqlRestoreContent(targetResourceId, containerName, protectedItemName);
+            // For SQL ALR, extract data directory paths from recovery point extended info
+            IList<SqlDataDirectoryMapping>? sqlDataDirMappings = null;
+            if (!string.IsNullOrEmpty(targetDatabaseName))
+            {
+                var rpData = await rpResource.GetAsync(cancellationToken: cancellationToken);
+                if (rpData.Value.Data.Properties is WorkloadSqlRecoveryPoint sqlRp
+                    && sqlRp.ExtendedInfo?.DataDirectoryPaths is { } dataDirs)
+                {
+                    var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    sqlDataDirMappings = [];
+                    foreach (var dir in dataDirs)
+                    {
+                        if (string.IsNullOrEmpty(dir.Path) || string.IsNullOrEmpty(dir.LogicalName))
+                        {
+                            continue;
+                        }
+
+                        var sourceFileName = Path.GetFileNameWithoutExtension(dir.Path);
+                        var sourceExtension = Path.GetExtension(dir.Path);
+                        var sourceDir = Path.GetDirectoryName(dir.Path) ?? string.Empty;
+                        var targetPath = Path.Combine(sourceDir, $"{sourceFileName}_{timestamp}{sourceExtension}");
+
+                        sqlDataDirMappings.Add(new SqlDataDirectoryMapping
+                        {
+                            MappingType = dir.DirectoryType,
+                            SourceLogicalName = dir.LogicalName,
+                            SourcePath = dir.Path,
+                            TargetPath = targetPath
+                        });
+                    }
+                }
+            }
+
+            restoreProperties = CreateWorkloadSqlRestoreContent(subscription, resourceGroup, vaultName, containerName, protectedItemName, targetDatabaseName, targetInstanceName, sqlDataDirMappings);
         }
         else if (existingProperties is VmWorkloadSapHanaDatabaseProtectedItem)
         {
@@ -376,13 +411,25 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             var sourceResourceId = (existingProperties as IaasComputeVmProtectedItem)?.SourceResourceId
                 ?? (existingProperties as BackupGenericProtectedItem)?.SourceResourceId;
 
+            // Determine restore mode: AlternateLocation, RestoreDisks, or OriginalLocation
+            var resolvedMode = !string.IsNullOrEmpty(restoreMode)
+                ? restoreMode
+                : !string.IsNullOrEmpty(targetResourceId) ? "RestoreDisks" : "OriginalLocation";
+
+            var recoveryType = resolvedMode switch
+            {
+                "AlternateLocation" => FileShareRecoveryType.AlternateLocation,
+                "RestoreDisks" => FileShareRecoveryType.RestoreDisks,
+                _ => FileShareRecoveryType.OriginalLocation
+            };
+
             var vmRestoreContent = new IaasVmRestoreContent
             {
                 RecoveryPointId = recoveryPointId,
-                RecoveryType = FileShareRecoveryType.OriginalLocation,
+                RecoveryType = recoveryType,
                 SourceResourceId = sourceResourceId,
                 Region = new AzureLocation(vaultLocation),
-                OriginalStorageAccountOption = true,
+                OriginalStorageAccountOption = recoveryType == FileShareRecoveryType.OriginalLocation,
                 DoesCreateNewCloudService = false
             };
 
@@ -391,11 +438,26 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
                 vmRestoreContent.StorageAccountId = new ResourceIdentifier(stagingStorageAccountId);
             }
 
-            if (!string.IsNullOrEmpty(targetResourceId))
+            if (recoveryType == FileShareRecoveryType.AlternateLocation)
             {
-                vmRestoreContent.RecoveryType = FileShareRecoveryType.AlternateLocation;
+                // Full ALR: create a new VM at alternate location
+                if (string.IsNullOrEmpty(targetVmName) || string.IsNullOrEmpty(targetVnetId) || string.IsNullOrEmpty(targetSubnetId))
+                {
+                    throw new ArgumentException("AlternateLocation restore requires --target-vm-name, --target-vnet-id, and --target-subnet-id parameters.");
+                }
+
+                vmRestoreContent.TargetResourceGroupId = !string.IsNullOrEmpty(targetResourceId)
+                    ? new ResourceIdentifier(targetResourceId)
+                    : new ResourceIdentifier($"/subscriptions/{subscription}/resourceGroups/{resourceGroup}");
+                vmRestoreContent.TargetVirtualMachineId = new ResourceIdentifier(
+                    $"/subscriptions/{subscription}/resourceGroups/{(targetResourceId != null ? new ResourceIdentifier(targetResourceId).Name : resourceGroup)}/providers/Microsoft.Compute/virtualMachines/{targetVmName}");
+                vmRestoreContent.VirtualNetworkId = new ResourceIdentifier(targetVnetId);
+                vmRestoreContent.SubnetId = new ResourceIdentifier(targetSubnetId);
+            }
+            else if (recoveryType == FileShareRecoveryType.RestoreDisks && !string.IsNullOrEmpty(targetResourceId))
+            {
+                // RestoreDisks: restore managed disks to target RG
                 vmRestoreContent.TargetResourceGroupId = new ResourceIdentifier(targetResourceId);
-                vmRestoreContent.OriginalStorageAccountOption = false;
             }
 
             restoreProperties = vmRestoreContent;
@@ -1257,21 +1319,53 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
     }
 
     private static RestoreContent CreateWorkloadSqlRestoreContent(
-        string? targetResourceId, string containerName, string protectedItemName)
+        string subscription, string resourceGroup, string vaultName,
+        string containerName, string protectedItemName, string? targetDatabaseName, string? targetInstanceName,
+        IList<SqlDataDirectoryMapping>? dataDirectoryMappings)
     {
-        if (!string.IsNullOrEmpty(targetResourceId))
+        if (!string.IsNullOrEmpty(targetDatabaseName))
         {
-            return new WorkloadSqlRestoreContent
+            // ALR: restore to a different database on the same or different SQL instance
+            var resolvedInstanceName = targetInstanceName ?? "mssqlserver";
+
+            // Derive VM ARM ID from container name (format: VMAppContainer;Compute;{RG};{VMName})
+            var containerParts = containerName.Split(';');
+            var vmResourceGroup = containerParts.Length > 2 ? containerParts[2] : resourceGroup;
+            var vmName = containerParts.Length > 3 ? containerParts[3] : string.Empty;
+            var vmId = new ResourceIdentifier(
+                $"/subscriptions/{subscription}/resourceGroups/{vmResourceGroup}/providers/Microsoft.Compute/virtualMachines/{vmName}");
+
+            // ContainerId must be the full ARM resource ID with lowercase container name
+            var fullContainerId = $"/subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.RecoveryServices/vaults/{vaultName}/backupFabrics/{FabricName}/protectionContainers/{containerName.ToLowerInvariant()}";
+
+            // DatabaseName format: {INSTANCE_UPPER}/SQLInstance;{instance_lower} (target SQL instance path)
+            var databaseName = $"{resolvedInstanceName.ToUpperInvariant()}/SQLInstance;{resolvedInstanceName.ToLowerInvariant()}";
+
+            var content = new WorkloadSqlRestoreContent
             {
                 RecoveryType = FileShareRecoveryType.AlternateLocation,
+                SourceResourceId = vmId,
+                TargetVirtualMachineId = vmId,
                 ShouldUseAlternateTargetLocation = true,
+                IsNonRecoverable = false,
                 TargetInfo = new TargetRestoreInfo
                 {
-                    OverwriteOption = RestoreOverwriteOption.FailOnConflict,
-                    ContainerId = containerName,
-                    DatabaseName = protectedItemName
+                    OverwriteOption = RestoreOverwriteOption.Overwrite,
+                    ContainerId = fullContainerId,
+                    DatabaseName = databaseName
                 }
             };
+
+            // Add alternate directory paths for SQL data/log file mapping
+            if (dataDirectoryMappings != null)
+            {
+                foreach (var mapping in dataDirectoryMappings)
+                {
+                    content.AlternateDirectoryPaths.Add(mapping);
+                }
+            }
+
+            return content;
         }
 
         return new WorkloadSqlRestoreContent

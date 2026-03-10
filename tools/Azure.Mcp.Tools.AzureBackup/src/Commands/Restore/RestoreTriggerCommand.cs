@@ -45,6 +45,12 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
         command.Options.Add(AzureBackupOptionDefinitions.TargetResourceId);
         command.Options.Add(AzureBackupOptionDefinitions.RestoreLocation);
         command.Options.Add(AzureBackupOptionDefinitions.StagingStorageAccountId);
+        command.Options.Add(AzureBackupOptionDefinitions.RestoreMode);
+        command.Options.Add(AzureBackupOptionDefinitions.TargetVmName);
+        command.Options.Add(AzureBackupOptionDefinitions.TargetVnetId);
+        command.Options.Add(AzureBackupOptionDefinitions.TargetSubnetId);
+        command.Options.Add(AzureBackupOptionDefinitions.TargetDatabaseName);
+        command.Options.Add(AzureBackupOptionDefinitions.TargetInstanceName);
     }
 
     protected override RestoreTriggerOptions BindOptions(ParseResult parseResult)
@@ -55,6 +61,12 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
         options.TargetResourceId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetResourceId.Name);
         options.RestoreLocation = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.RestoreLocation.Name);
         options.StagingStorageAccountId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.StagingStorageAccountId.Name);
+        options.RestoreMode = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.RestoreMode.Name);
+        options.TargetVmName = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetVmName.Name);
+        options.TargetVnetId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetVnetId.Name);
+        options.TargetSubnetId = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetSubnetId.Name);
+        options.TargetDatabaseName = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetDatabaseName.Name);
+        options.TargetInstanceName = parseResult.GetValueOrDefault<string>(AzureBackupOptionDefinitions.TargetInstanceName.Name);
         return options;
     }
 
@@ -87,6 +99,12 @@ public sealed class RestoreTriggerCommand(ILogger<RestoreTriggerCommand> logger)
                 options.RestoreLocation,
                 options.StagingStorageAccountId,
                 options.PointInTime,
+                options.RestoreMode,
+                options.TargetVmName,
+                options.TargetVnetId,
+                options.TargetSubnetId,
+                options.TargetDatabaseName,
+                options.TargetInstanceName,
                 options.Tenant,
                 options.RetryPolicy,
                 cancellationToken);
