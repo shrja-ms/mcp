@@ -46,7 +46,7 @@ public class ProtectedItemAutoProtectCommandTests
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(expectedResult));
 
-        var args = _commandDefinition.Parse(["--subscription", "sub123", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
+        var args = _commandDefinition.Parse(["--subscription", "sub123", "--resource-group", "rg1", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
         var response = await _command.ExecuteAsync(_context, args, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.Status);
@@ -66,7 +66,7 @@ public class ProtectedItemAutoProtectCommandTests
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new RequestFailedException((int)HttpStatusCode.NotFound, "Not found"));
 
-        var args = _commandDefinition.Parse(["--subscription", "sub123", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
+        var args = _commandDefinition.Parse(["--subscription", "sub123", "--resource-group", "rg1", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
         var response = await _command.ExecuteAsync(_context, args, TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.NotFound, response.Status);
     }
@@ -81,7 +81,7 @@ public class ProtectedItemAutoProtectCommandTests
             Arg.Any<RetryPolicyOptions?>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new Exception("Test error"));
 
-        var args = _commandDefinition.Parse(["--subscription", "sub123", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
+        var args = _commandDefinition.Parse(["--subscription", "sub123", "--resource-group", "rg1", "--vault", "vault1", "--vm-resource-id", "vmId1", "--instance-name", "inst1", "--policy", "pol1", "--workload-type", "SQLDataBase"]);
         var response = await _command.ExecuteAsync(_context, args, TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.InternalServerError, response.Status);
     }

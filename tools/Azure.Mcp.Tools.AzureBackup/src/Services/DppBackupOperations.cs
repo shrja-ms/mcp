@@ -20,39 +20,90 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
     /// <summary>
     /// Maps friendly workload type names to ARM resource type strings for DPP policies.
     /// </summary>
-    private static string MapWorkloadTypeToArmResourceType(string workloadType) => workloadType.ToLowerInvariant() switch
+    internal static string MapWorkloadTypeToArmResourceType(string workloadType) => workloadType.ToLowerInvariant() switch
     {
         "azuredisk" => "Microsoft.Compute/disks",
         "azureblob" => "Microsoft.Storage/storageAccounts/blobServices",
         "postgresqlflexible" => "Microsoft.DBforPostgreSQL/flexibleServers",
         "mysqlflexible" => "Microsoft.DBforMySQL/flexibleServers",
         "aks" => "Microsoft.ContainerService/managedClusters",
+        "elasticsan" => "Microsoft.ElasticSan/elasticSans/volumeGroups",
         _ => workloadType // If already an ARM resource type, pass through
     };
 
     /// <summary>
     /// Determines if a DPP datasource type uses OperationalStore (snapshot-based) vs VaultStore.
     /// </summary>
-    private static bool UsesOperationalStore(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    internal static bool UsesOperationalStore(string datasourceType) => datasourceType.ToLowerInvariant() switch
     {
         "microsoft.compute/disks" => true,
         "microsoft.storage/storageaccounts/blobservices" => true,
         "microsoft.containerservice/managedclusters" => true,
+        "microsoft.elasticsan/elasticsans/volumegroups" => true,
         "azuredisk" => true,
         "azureblob" => true,
         "aks" => true,
+        "elasticsan" => true,
         _ => false
     };
 
     /// <summary>
     /// Determines if a datasource type is for blob operational backup (continuous, no scheduled backup rule).
     /// </summary>
-    private static bool IsBlobOperationalBackup(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    internal static bool IsBlobOperationalBackup(string datasourceType) => datasourceType.ToLowerInvariant() switch
     {
         "microsoft.storage/storageaccounts/blobservices" => true,
         "azureblob" => true,
         _ => false
     };
+
+    /// <summary>
+    /// Determines if a datasource type is for Elastic SAN backup.
+    /// ESAN uses OperationalStore with daily (P1D) schedule instead of hourly (PT4H) like Disk/AKS.
+    /// ESAN also requires DataSourceSetInfo pointing to the parent ElasticSan resource.
+    /// </summary>
+    internal static bool IsElasticSanWorkload(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    {
+        "microsoft.elasticsan/elasticsans/volumegroups" => true,
+        "elasticsan" => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Determines if a datasource type is for AKS backup.
+    /// AKS requires DataSourceSetInfo pointing to the cluster itself (container of namespaces).
+    /// </summary>
+    internal static bool IsAksWorkload(string datasourceType) => datasourceType.ToLowerInvariant() switch
+    {
+        "microsoft.containerservice/managedclusters" => true,
+        "aks" => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Determines if a datasource type requires DataSourceSetInfo.
+    /// Both ESAN and AKS workloads require DataSourceSetInfo in protect and restore payloads.
+    /// </summary>
+    internal static bool RequiresDataSourceSetInfo(string datasourceType) =>
+        IsElasticSanWorkload(datasourceType) || IsAksWorkload(datasourceType);
+
+    /// <summary>
+    /// Derives the parent Elastic SAN resource ID from a volume group resource ID.
+    /// e.g., ".../elasticSans/mysan/volumeGroups/myvg" => ".../elasticSans/mysan"
+    /// </summary>
+    internal static ResourceIdentifier GetElasticSanParentId(ResourceIdentifier volumeGroupId)
+    {
+        // VolumeGroup ID: .../providers/Microsoft.ElasticSan/elasticSans/{sanName}/volumeGroups/{vgName}
+        // Parent ESAN ID: .../providers/Microsoft.ElasticSan/elasticSans/{sanName}
+        var idStr = volumeGroupId.ToString();
+        var vgIndex = idStr.LastIndexOf("/volumeGroups/", StringComparison.OrdinalIgnoreCase);
+        if (vgIndex > 0)
+        {
+            return new ResourceIdentifier(idStr[..vgIndex]);
+        }
+
+        return volumeGroupId.Parent ?? volumeGroupId;
+    }
 
     public async Task<VaultCreateResult> CreateVaultAsync(
         string vaultName, string resourceGroup, string subscription, string location,
@@ -157,6 +208,8 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         // Auto-detect blob storage: if the datasource is a storage account, set the datasource type
         // to blobServices but keep the resource ID pointing to the storage account (not blobServices/default)
         var resolvedDatasourceType = datasourceType ?? datasourceResourceId.ResourceType.ToString();
+        // Map friendly names (e.g., "aks", "elasticsan", "azuredisk") to ARM resource types
+        resolvedDatasourceType = MapWorkloadTypeToArmResourceType(resolvedDatasourceType);
         if (resolvedDatasourceType.Equals("Microsoft.Storage/storageAccounts", StringComparison.OrdinalIgnoreCase)
             && !datasourceId.Contains("/blobServices/", StringComparison.OrdinalIgnoreCase))
         {
@@ -165,11 +218,14 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             resolvedDatasourceType = "Microsoft.Storage/storageAccounts/blobServices";
         }
 
-        var instanceName = $"{datasourceResourceId.Name}-{datasourceResourceId.Name}-{Guid.NewGuid().ToString("N")[..12]}";
+        // For ESAN, use parent-child naming: {esanName}-{vgName}-{guid}
+        var instanceName = IsElasticSanWorkload(resolvedDatasourceType)
+            ? $"{GetElasticSanParentId(datasourceResourceId).Name}-{datasourceResourceId.Name}-{Guid.NewGuid()}"
+            : $"{datasourceResourceId.Name}-{datasourceResourceId.Name}-{Guid.NewGuid().ToString("N")[..12]}";
 
         var policyInfo = new BackupInstancePolicyInfo(policyId);
 
-        // For Disk and AKS workloads that use OperationalStore (snapshot-based),
+        // For Disk, AKS, and ESAN workloads that use OperationalStore (snapshot-based),
         // set the snapshot resource group parameter (defaults to the datasource's resource group)
         if (UsesOperationalStore(resolvedDatasourceType) && !IsBlobOperationalBackup(resolvedDatasourceType))
         {
@@ -180,6 +236,16 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             };
             policyInfo.PolicyParameters = new BackupInstancePolicySettings();
             policyInfo.PolicyParameters.DataStoreParametersList.Add(opStoreSettings);
+
+            // AKS requires BackupDataSourceParametersList with cluster backup settings
+            // (which namespaces/volumes to back up, cluster-scope resources, etc.)
+            if (IsAksWorkload(resolvedDatasourceType))
+            {
+                var aksSettings = new KubernetesClusterBackupDataSourceSettings(
+                    isSnapshotVolumesEnabled: true,
+                    isClusterScopeResourcesIncluded: true);
+                policyInfo.PolicyParameters.BackupDataSourceParametersList.Add(aksSettings);
+            }
         }
 
         var dataSourceInfo = new DataSourceInfo(datasourceResourceId)
@@ -197,6 +263,25 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         {
             ObjectType = "BackupInstance",
         };
+
+        // ESAN and AKS require DataSourceSetInfo
+        // ESAN: points to the parent Elastic SAN resource
+        // AKS: points to the AKS cluster itself (datasource == datasource set)
+        if (RequiresDataSourceSetInfo(resolvedDatasourceType))
+        {
+            var setId = IsElasticSanWorkload(resolvedDatasourceType)
+                ? GetElasticSanParentId(datasourceResourceId)
+                : datasourceResourceId;
+            instanceProperties.DataSourceSetInfo = new DataSourceSetInfo(setId)
+            {
+                DataSourceType = resolvedDatasourceType,
+                ObjectType = "DatasourceSet",
+                ResourceType = setId.ResourceType,
+                ResourceName = setId.Name,
+                ResourceLocation = vaultData.Value.Data.Location,
+            };
+        }
+
         var instanceData = new DataProtectionBackupInstanceData
         {
             Properties = instanceProperties
@@ -383,12 +468,32 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
                 ResourceLocation = location,
             };
 
-            restoreTarget = new RestoreTargetInfo(
+            var restoreTargetInfo = new RestoreTargetInfo(
                 RecoverySetting.FailIfExists,
                 targetDatasource)
             {
                 RestoreLocation = location,
             };
+
+            // ESAN and AKS restore require DataSourceSetInfo
+            var resolvedDatasourceTypeStr = datasourceInfo?.DataSourceType ?? string.Empty;
+            if (RequiresDataSourceSetInfo(resolvedDatasourceTypeStr))
+            {
+                var dsId = targetId ?? datasourceId!;
+                var setId = IsElasticSanWorkload(resolvedDatasourceTypeStr)
+                    ? GetElasticSanParentId(dsId)
+                    : dsId;
+                restoreTargetInfo.DataSourceSetInfo = new DataSourceSetInfo(setId)
+                {
+                    DataSourceType = datasourceInfo?.DataSourceType,
+                    ObjectType = "DatasourceSet",
+                    ResourceType = setId.ResourceType,
+                    ResourceName = setId.Name,
+                    ResourceLocation = location,
+                };
+            }
+
+            restoreTarget = restoreTargetInfo;
         }
 
         // Determine the correct source data store type based on datasource type
@@ -660,9 +765,11 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         // For all other workloads, add a scheduled backup rule
         if (!isBlobOperational)
         {
-            // Disk and AKS use PT4H (hourly) schedule; VaultStore workloads use P1D (daily)
-            var scheduleInterval = useOperationalStore ? "PT4H" : "P1D";
-            var ruleName = useOperationalStore ? "BackupHourly" : "BackupDaily";
+            // Disk and AKS use PT4H (hourly) schedule; ESAN and VaultStore workloads use P1D (daily)
+            var isElasticSan = IsElasticSanWorkload(workloadType);
+            var useHourlySchedule = useOperationalStore && !isElasticSan;
+            var scheduleInterval = useHourlySchedule ? "PT4H" : "P1D";
+            var ruleName = useHourlySchedule ? "BackupHourly" : "BackupDaily";
             var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/{scheduleInterval}";
 
             var schedule = new DataProtectionBackupSchedule([repeatingInterval])
