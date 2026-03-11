@@ -18,91 +18,20 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
     private const string VaultType = VaultTypeResolver.Dpp;
 
     /// <summary>
-    /// Maps friendly workload type names to ARM resource type strings for DPP policies.
+    /// Resolves the DPP datasource profile from a user-supplied or auto-detected type string.
+    /// Handles auto-detection (e.g. "Microsoft.Storage/storageAccounts" → Blob profile)
+    /// and friendly name mapping (e.g. "aks" → AKS profile).
     /// </summary>
-    internal static string MapWorkloadTypeToArmResourceType(string workloadType) => workloadType.ToLowerInvariant() switch
+    internal static DppDatasourceProfile ResolveProfile(string datasourceTypeOrArm)
     {
-        "azuredisk" => "Microsoft.Compute/disks",
-        "azureblob" => "Microsoft.Storage/storageAccounts/blobServices",
-        "postgresqlflexible" => "Microsoft.DBforPostgreSQL/flexibleServers",
-        "mysqlflexible" => "Microsoft.DBforMySQL/flexibleServers",
-        "aks" => "Microsoft.ContainerService/managedClusters",
-        "elasticsan" => "Microsoft.ElasticSan/elasticSans/volumeGroups",
-        _ => workloadType // If already an ARM resource type, pass through
-    };
-
-    /// <summary>
-    /// Determines if a DPP datasource type uses OperationalStore (snapshot-based) vs VaultStore.
-    /// </summary>
-    internal static bool UsesOperationalStore(string datasourceType) => datasourceType.ToLowerInvariant() switch
-    {
-        "microsoft.compute/disks" => true,
-        "microsoft.storage/storageaccounts/blobservices" => true,
-        "microsoft.containerservice/managedclusters" => true,
-        "microsoft.elasticsan/elasticsans/volumegroups" => true,
-        "azuredisk" => true,
-        "azureblob" => true,
-        "aks" => true,
-        "elasticsan" => true,
-        _ => false
-    };
-
-    /// <summary>
-    /// Determines if a datasource type is for blob operational backup (continuous, no scheduled backup rule).
-    /// </summary>
-    internal static bool IsBlobOperationalBackup(string datasourceType) => datasourceType.ToLowerInvariant() switch
-    {
-        "microsoft.storage/storageaccounts/blobservices" => true,
-        "azureblob" => true,
-        _ => false
-    };
-
-    /// <summary>
-    /// Determines if a datasource type is for Elastic SAN backup.
-    /// ESAN uses OperationalStore with daily (P1D) schedule instead of hourly (PT4H) like Disk/AKS.
-    /// ESAN also requires DataSourceSetInfo pointing to the parent ElasticSan resource.
-    /// </summary>
-    internal static bool IsElasticSanWorkload(string datasourceType) => datasourceType.ToLowerInvariant() switch
-    {
-        "microsoft.elasticsan/elasticsans/volumegroups" => true,
-        "elasticsan" => true,
-        _ => false
-    };
-
-    /// <summary>
-    /// Determines if a datasource type is for AKS backup.
-    /// AKS requires DataSourceSetInfo pointing to the cluster itself (container of namespaces).
-    /// </summary>
-    internal static bool IsAksWorkload(string datasourceType) => datasourceType.ToLowerInvariant() switch
-    {
-        "microsoft.containerservice/managedclusters" => true,
-        "aks" => true,
-        _ => false
-    };
-
-    /// <summary>
-    /// Determines if a datasource type requires DataSourceSetInfo.
-    /// Both ESAN and AKS workloads require DataSourceSetInfo in protect and restore payloads.
-    /// </summary>
-    internal static bool RequiresDataSourceSetInfo(string datasourceType) =>
-        IsElasticSanWorkload(datasourceType) || IsAksWorkload(datasourceType);
-
-    /// <summary>
-    /// Derives the parent Elastic SAN resource ID from a volume group resource ID.
-    /// e.g., ".../elasticSans/mysan/volumeGroups/myvg" => ".../elasticSans/mysan"
-    /// </summary>
-    internal static ResourceIdentifier GetElasticSanParentId(ResourceIdentifier volumeGroupId)
-    {
-        // VolumeGroup ID: .../providers/Microsoft.ElasticSan/elasticSans/{sanName}/volumeGroups/{vgName}
-        // Parent ESAN ID: .../providers/Microsoft.ElasticSan/elasticSans/{sanName}
-        var idStr = volumeGroupId.ToString();
-        var vgIndex = idStr.LastIndexOf("/volumeGroups/", StringComparison.OrdinalIgnoreCase);
-        if (vgIndex > 0)
+        // First try auto-detection (e.g. storage account → Blob)
+        var autoDetected = DppDatasourceRegistry.TryAutoDetect(datasourceTypeOrArm);
+        if (autoDetected != null)
         {
-            return new ResourceIdentifier(idStr[..vgIndex]);
+            return autoDetected;
         }
 
-        return volumeGroupId.Parent ?? volumeGroupId;
+        return DppDatasourceRegistry.Resolve(datasourceTypeOrArm);
     }
 
     public async Task<VaultCreateResult> CreateVaultAsync(
@@ -205,29 +134,17 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var policyId = DataProtectionBackupPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
         var datasourceResourceId = new ResourceIdentifier(datasourceId);
 
-        // Auto-detect blob storage: if the datasource is a storage account, set the datasource type
-        // to blobServices but keep the resource ID pointing to the storage account (not blobServices/default)
+        // Resolve the datasource profile from user-supplied type or auto-detect from ARM resource type
         var resolvedDatasourceType = datasourceType ?? datasourceResourceId.ResourceType.ToString();
-        // Map friendly names (e.g., "aks", "elasticsan", "azuredisk") to ARM resource types
-        resolvedDatasourceType = MapWorkloadTypeToArmResourceType(resolvedDatasourceType);
-        if (resolvedDatasourceType.Equals("Microsoft.Storage/storageAccounts", StringComparison.OrdinalIgnoreCase)
-            && !datasourceId.Contains("/blobServices/", StringComparison.OrdinalIgnoreCase))
-        {
-            // Blob operational backup uses storageAccounts/blobServices as the datasource type
-            // but the resource ID stays as the storage account (no /blobServices/default appended)
-            resolvedDatasourceType = "Microsoft.Storage/storageAccounts/blobServices";
-        }
+        var profile = ResolveProfile(resolvedDatasourceType);
 
-        // For ESAN, use parent-child naming: {esanName}-{vgName}-{guid}
-        var instanceName = IsElasticSanWorkload(resolvedDatasourceType)
-            ? $"{GetElasticSanParentId(datasourceResourceId).Name}-{datasourceResourceId.Name}-{Guid.NewGuid()}"
-            : $"{datasourceResourceId.Name}-{datasourceResourceId.Name}-{Guid.NewGuid().ToString("N")[..12]}";
+        // Generate instance name based on profile's naming mode
+        var instanceName = DppDatasourceRegistry.GenerateInstanceName(profile, datasourceResourceId);
 
         var policyInfo = new BackupInstancePolicyInfo(policyId);
 
-        // For Disk, AKS, and ESAN workloads that use OperationalStore (snapshot-based),
-        // set the snapshot resource group parameter (defaults to the datasource's resource group)
-        if (UsesOperationalStore(resolvedDatasourceType) && !IsBlobOperationalBackup(resolvedDatasourceType))
+        // Set snapshot resource group for datasource types that require it (Disk, AKS, ESAN — not Blob)
+        if (profile.RequiresSnapshotResourceGroup)
         {
             var snapshotRgId = ResourceGroupResource.CreateResourceIdentifier(subscription, datasourceResourceId.ResourceGroupName ?? resourceGroup);
             var opStoreSettings = new OperationalDataStoreSettings(DataStoreType.OperationalStore)
@@ -236,21 +153,21 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             };
             policyInfo.PolicyParameters = new BackupInstancePolicySettings();
             policyInfo.PolicyParameters.DataStoreParametersList.Add(opStoreSettings);
+        }
 
-            // AKS requires BackupDataSourceParametersList with cluster backup settings
-            // (which namespaces/volumes to back up, cluster-scope resources, etc.)
-            if (IsAksWorkload(resolvedDatasourceType))
-            {
-                var aksSettings = new KubernetesClusterBackupDataSourceSettings(
-                    isSnapshotVolumesEnabled: true,
-                    isClusterScopeResourcesIncluded: true);
-                policyInfo.PolicyParameters.BackupDataSourceParametersList.Add(aksSettings);
-            }
+        // Add datasource-specific backup parameters (e.g. AKS K8s cluster settings)
+        if (profile.BackupParametersMode == DppBackupParametersMode.KubernetesCluster)
+        {
+            policyInfo.PolicyParameters ??= new BackupInstancePolicySettings();
+            var aksSettings = new KubernetesClusterBackupDataSourceSettings(
+                isSnapshotVolumesEnabled: true,
+                isClusterScopeResourcesIncluded: true);
+            policyInfo.PolicyParameters.BackupDataSourceParametersList.Add(aksSettings);
         }
 
         var dataSourceInfo = new DataSourceInfo(datasourceResourceId)
         {
-            DataSourceType = resolvedDatasourceType,
+            DataSourceType = profile.ArmResourceType,
             ObjectType = "Datasource",
             ResourceType = datasourceResourceId.ResourceType,
             ResourceName = datasourceResourceId.Name,
@@ -264,17 +181,15 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             ObjectType = "BackupInstance",
         };
 
-        // ESAN and AKS require DataSourceSetInfo
-        // ESAN: points to the parent Elastic SAN resource
-        // AKS: points to the AKS cluster itself (datasource == datasource set)
-        if (RequiresDataSourceSetInfo(resolvedDatasourceType))
+        // Set DataSourceSetInfo based on profile configuration
+        if (profile.DataSourceSetMode != DppDataSourceSetMode.None)
         {
-            var setId = IsElasticSanWorkload(resolvedDatasourceType)
-                ? GetElasticSanParentId(datasourceResourceId)
+            var setId = profile.DataSourceSetMode == DppDataSourceSetMode.Parent
+                ? DppDatasourceRegistry.GetParentResourceId(datasourceResourceId)
                 : datasourceResourceId;
             instanceProperties.DataSourceSetInfo = new DataSourceSetInfo(setId)
             {
-                DataSourceType = resolvedDatasourceType,
+                DataSourceType = profile.ArmResourceType,
                 ObjectType = "DatasourceSet",
                 ResourceType = setId.ResourceType,
                 ResourceName = setId.Name,
@@ -475,13 +390,14 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
                 RestoreLocation = location,
             };
 
-            // ESAN and AKS restore require DataSourceSetInfo
+            // Set DataSourceSetInfo for datasource types that require it (ESAN, AKS)
             var resolvedDatasourceTypeStr = datasourceInfo?.DataSourceType ?? string.Empty;
-            if (RequiresDataSourceSetInfo(resolvedDatasourceTypeStr))
+            var restoreProfile = ResolveProfile(resolvedDatasourceTypeStr);
+            if (restoreProfile.DataSourceSetMode != DppDataSourceSetMode.None)
             {
                 var dsId = targetId ?? datasourceId!;
-                var setId = IsElasticSanWorkload(resolvedDatasourceTypeStr)
-                    ? GetElasticSanParentId(dsId)
+                var setId = restoreProfile.DataSourceSetMode == DppDataSourceSetMode.Parent
+                    ? DppDatasourceRegistry.GetParentResourceId(dsId)
                     : dsId;
                 restoreTargetInfo.DataSourceSetInfo = new DataSourceSetInfo(setId)
                 {
@@ -496,9 +412,10 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             restoreTarget = restoreTargetInfo;
         }
 
-        // Determine the correct source data store type based on datasource type
+        // Determine the correct source data store type from the datasource profile
         var datasourceTypeStr = datasourceInfo?.DataSourceType ?? string.Empty;
-        var sourceDataStoreType = UsesOperationalStore(datasourceTypeStr) ? SourceDataStoreType.OperationalStore : SourceDataStoreType.VaultStore;
+        var storeProfile = ResolveProfile(datasourceTypeStr);
+        var sourceDataStoreType = storeProfile.UsesOperationalStore ? SourceDataStoreType.OperationalStore : SourceDataStoreType.VaultStore;
 
         // Use time-based restore for blob PIT or when --point-in-time is provided
         BackupRestoreContent restoreContent;
@@ -591,9 +508,20 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
         var jobResourceId = DataProtectionBackupJobResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, jobId);
         var jobResource = armClient.GetDataProtectionBackupJobResource(jobResourceId);
-        var job = await jobResource.GetAsync(cancellationToken);
 
-        return MapToJobInfo(job.Value.Data);
+        try
+        {
+            var job = await jobResource.GetAsync(cancellationToken);
+            return MapToJobInfo(job.Value.Data);
+        }
+        catch (FormatException)
+        {
+            // Bug #40 workaround: SDK can't parse ISO 8601 durations like "PT3M7.0153191S"
+            // in DataProtectionBackupJobData. Fall back to listing jobs and matching by ID.
+            var jobs = await ListJobsAsync(vaultName, resourceGroup, subscription, tenant, retryPolicy, cancellationToken);
+            return jobs.FirstOrDefault(j => j.Name == jobId)
+                ?? throw new InvalidOperationException($"Job '{jobId}' not found. The SDK cannot parse this job's duration field.");
+        }
     }
 
     public async Task<List<BackupJobInfo>> ListJobsAsync(
@@ -779,7 +707,7 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var collection = vaultResource.GetDataProtectionBackupPolicies();
 
         // Parse retention and schedule parameters
-        var retentionDays = int.TryParse(dailyRetentionDays, out var dd) ? dd : 30;
+        var retentionDays = int.TryParse(dailyRetentionDays, out var dd) ? dd : 0;
         var scheduleTimeValue = scheduleTime ?? "02:00";
         var now = DateTimeOffset.UtcNow;
         var scheduleParts = scheduleTimeValue.Split(':');
@@ -787,14 +715,14 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         var scheduleMinute = scheduleParts.Length > 1 && int.TryParse(scheduleParts[1], out var sm) ? sm : 0;
         var scheduleStartTime = new DateTimeOffset(now.Year, now.Month, now.Day, scheduleHour, scheduleMinute, 0, TimeSpan.Zero);
 
-        // Map friendly workload type to ARM resource type and determine data store type
-        var resolvedWorkloadType = MapWorkloadTypeToArmResourceType(workloadType);
-        var useOperationalStore = UsesOperationalStore(workloadType);
-        var isBlobOperational = IsBlobOperationalBackup(workloadType);
-        var dataStoreType = useOperationalStore ? DataStoreType.OperationalStore : DataStoreType.VaultStore;
+        // Resolve the datasource profile — drives all policy construction decisions
+        var profile = DppDatasourceRegistry.Resolve(workloadType);
+        var dataStoreType = profile.UsesOperationalStore ? DataStoreType.OperationalStore : DataStoreType.VaultStore;
 
-        // Build the retention rule (Default) - use 7 days for operational store if not specified
-        var defaultRetention = useOperationalStore && !int.TryParse(dailyRetentionDays, out _) ? 7 : retentionDays;
+        // Use profile default retention if user didn't specify
+        var defaultRetention = retentionDays > 0 ? retentionDays : profile.DefaultRetentionDays;
+
+        // Build the retention rule (Default)
         var retentionDeleteSetting = new DataProtectionBackupAbsoluteDeleteSetting(TimeSpan.FromDays(defaultRetention));
         var retentionDataStore = new DataStoreInfoBase(dataStoreType, "DataStoreInfoBase");
         var retentionLifeCycle = new SourceLifeCycle(retentionDeleteSetting, retentionDataStore);
@@ -805,16 +733,11 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
 
         List<DataProtectionBasePolicyRule> rules = [retentionRule];
 
-        // Blob operational backup uses continuous mode - no scheduled backup rule needed
-        // For all other workloads, add a scheduled backup rule
-        if (!isBlobOperational)
+        // Continuous backup (Blob, ADLS, CosmosDB) — no scheduled backup rule
+        // All other workloads — add a scheduled backup rule driven by profile settings
+        if (!profile.IsContinuousBackup)
         {
-            // Disk and AKS use PT4H (hourly) schedule; ESAN and VaultStore workloads use P1D (daily)
-            var isElasticSan = IsElasticSanWorkload(workloadType);
-            var useHourlySchedule = useOperationalStore && !isElasticSan;
-            var scheduleInterval = useHourlySchedule ? "PT4H" : "P1D";
-            var ruleName = useHourlySchedule ? "BackupHourly" : "BackupDaily";
-            var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/{scheduleInterval}";
+            var repeatingInterval = $"R/{scheduleStartTime:yyyy-MM-ddTHH:mm:ss+00:00}/{profile.ScheduleInterval}";
 
             var schedule = new DataProtectionBackupSchedule([repeatingInterval])
             {
@@ -824,17 +747,16 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
             var taggingCriteria = new DataProtectionBackupTaggingCriteria(true, 99, defaultTag);
             var triggerContext = new ScheduleBasedBackupTriggerContext(schedule, [taggingCriteria]);
             var backupDataStore = new DataStoreInfoBase(dataStoreType, "DataStoreInfoBase");
-            var backupRule = new DataProtectionBackupRule(ruleName, backupDataStore, triggerContext)
+            var backupRule = new DataProtectionBackupRule(profile.BackupRuleName, backupDataStore, triggerContext)
             {
-                // Disk/AKS use "Incremental" backup type; VaultStore workloads use "Full"
-                BackupParameters = new DataProtectionBackupSettings(useOperationalStore ? "Incremental" : "Full"),
+                BackupParameters = new DataProtectionBackupSettings(profile.BackupType),
             };
 
             rules.Add(backupRule);
         }
 
         var policyProperties = new RuleBasedBackupPolicy(
-            [resolvedWorkloadType],
+            [profile.ArmResourceType],
             rules);
         var policyData = new DataProtectionBackupPolicyData { Properties = policyProperties };
 
