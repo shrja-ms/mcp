@@ -251,11 +251,10 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
         string? weeklyRetentionWeeks, string? tenant,
         RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
     {
-        // Update policy reuses create with same name (CreateOrUpdate semantics)
         var resolved = await ResolveVaultTypeAsync(vaultName, resourceGroup, subscription, vaultType, tenant, retryPolicy, cancellationToken);
         return VaultTypeResolver.IsRsv(resolved)
-            ? await rsvOps.CreatePolicyAsync(vaultName, resourceGroup, subscription, policyName, "VM", scheduleFrequency, null, dailyRetentionDays, weeklyRetentionWeeks, null, null, tenant, retryPolicy, cancellationToken)
-            : await dppOps.CreatePolicyAsync(vaultName, resourceGroup, subscription, policyName, "VM", scheduleFrequency, null, dailyRetentionDays, weeklyRetentionWeeks, null, null, tenant, retryPolicy, cancellationToken);
+            ? await rsvOps.UpdatePolicyAsync(vaultName, resourceGroup, subscription, policyName, scheduleFrequency, dailyRetentionDays, weeklyRetentionWeeks, tenant, retryPolicy, cancellationToken)
+            : await dppOps.UpdatePolicyAsync(vaultName, resourceGroup, subscription, policyName, scheduleFrequency, dailyRetentionDays, weeklyRetentionWeeks, tenant, retryPolicy, cancellationToken);
     }
 
     public async Task<OperationResult> DeletePolicyAsync(

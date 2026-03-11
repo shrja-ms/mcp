@@ -671,6 +671,110 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         return new OperationResult("Succeeded", null, $"Vault '{vaultName}' deleted successfully.");
     }
 
+    public async Task<OperationResult> UpdatePolicyAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string policyName, string? scheduleFrequency,
+        string? dailyRetentionDays, string? weeklyRetentionWeeks,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(policyName), policyName));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        // Fetch the existing policy — will throw RequestFailedException (404) if it doesn't exist
+        var policyId = BackupProtectionPolicyResource.CreateResourceIdentifier(
+            subscription, resourceGroup, vaultName, policyName);
+        var policyResource = armClient.GetBackupProtectionPolicyResource(policyId);
+        var existingPolicy = await policyResource.GetAsync(cancellationToken);
+        var policyData = existingPolicy.Value.Data;
+
+        // Modify only the requested fields on the existing policy
+        if (policyData.Properties is IaasVmProtectionPolicy vmPolicy)
+        {
+            UpdateVmPolicyRetention(vmPolicy, dailyRetentionDays, weeklyRetentionWeeks);
+            UpdateVmPolicySchedule(vmPolicy, scheduleFrequency);
+        }
+        else if (policyData.Properties is VmWorkloadProtectionPolicy workloadPolicy)
+        {
+            UpdateWorkloadPolicyRetention(workloadPolicy, dailyRetentionDays);
+        }
+
+        // PUT the modified policy back
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+        var policyCollection = rgResource.GetBackupProtectionPolicies(vaultName);
+        await policyCollection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Policy '{policyName}' updated in vault '{vaultName}'.");
+    }
+
+    private static void UpdateVmPolicyRetention(IaasVmProtectionPolicy vmPolicy, string? dailyRetentionDays, string? weeklyRetentionWeeks)
+    {
+        if (vmPolicy.RetentionPolicy is LongTermRetentionPolicy longTermRetention)
+        {
+            if (int.TryParse(dailyRetentionDays, out var days) && longTermRetention.DailySchedule != null)
+            {
+                longTermRetention.DailySchedule.RetentionDuration = new RetentionDuration
+                {
+                    Count = days,
+                    DurationType = RetentionDurationType.Days
+                };
+            }
+
+            if (int.TryParse(weeklyRetentionWeeks, out var weeks) && longTermRetention.WeeklySchedule != null)
+            {
+                longTermRetention.WeeklySchedule.RetentionDuration = new RetentionDuration
+                {
+                    Count = weeks,
+                    DurationType = RetentionDurationType.Weeks
+                };
+            }
+        }
+    }
+
+    private static void UpdateVmPolicySchedule(IaasVmProtectionPolicy vmPolicy, string? scheduleFrequency)
+    {
+        if (!string.IsNullOrEmpty(scheduleFrequency) && vmPolicy.SchedulePolicy is SimpleSchedulePolicy simpleSchedule)
+        {
+            if (Enum.TryParse<ScheduleRunType>(scheduleFrequency, true, out var frequency))
+            {
+                simpleSchedule.ScheduleRunFrequency = frequency;
+            }
+        }
+    }
+
+    private static void UpdateWorkloadPolicyRetention(VmWorkloadProtectionPolicy workloadPolicy, string? dailyRetentionDays)
+    {
+        if (!int.TryParse(dailyRetentionDays, out var days))
+        {
+            return;
+        }
+
+        foreach (var subPolicy in workloadPolicy.SubProtectionPolicy)
+        {
+            if (subPolicy.RetentionPolicy is LongTermRetentionPolicy longTermRetention && longTermRetention.DailySchedule != null)
+            {
+                longTermRetention.DailySchedule.RetentionDuration = new RetentionDuration
+                {
+                    Count = days,
+                    DurationType = RetentionDurationType.Days
+                };
+            }
+            else if (subPolicy.RetentionPolicy is SimpleRetentionPolicy simpleRetention)
+            {
+                simpleRetention.RetentionDuration = new RetentionDuration
+                {
+                    Count = days,
+                    DurationType = RetentionDurationType.Days
+                };
+            }
+        }
+    }
+
     public async Task<OperationResult> CreatePolicyAsync(
         string vaultName, string resourceGroup, string subscription,
         string policyName, string workloadType,

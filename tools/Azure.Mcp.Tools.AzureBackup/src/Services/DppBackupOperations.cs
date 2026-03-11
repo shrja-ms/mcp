@@ -714,6 +714,50 @@ public class DppBackupOperations(ITenantService tenantService) : BaseAzureServic
         return new OperationResult("Succeeded", null, $"Vault '{vaultName}' deleted successfully.");
     }
 
+    public async Task<OperationResult> UpdatePolicyAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string policyName, string? scheduleFrequency,
+        string? dailyRetentionDays, string? weeklyRetentionWeeks,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription),
+            (nameof(policyName), policyName));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+
+        // Fetch the existing policy — will throw RequestFailedException (404) if it doesn't exist
+        var policyId = DataProtectionBackupPolicyResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName, policyName);
+        var policyResource = armClient.GetDataProtectionBackupPolicyResource(policyId);
+        var existingPolicy = await policyResource.GetAsync(cancellationToken);
+        var policyData = existingPolicy.Value.Data;
+
+        // Modify only the requested retention on existing policy rules, preserving datasourceTypes and structure
+        if (policyData.Properties is RuleBasedBackupPolicy ruleBasedPolicy)
+        {
+            foreach (var rule in ruleBasedPolicy.PolicyRules)
+            {
+                if (rule is DataProtectionRetentionRule retentionRule && int.TryParse(dailyRetentionDays, out var days))
+                {
+                    foreach (var lifecycle in retentionRule.Lifecycles)
+                    {
+                        lifecycle.DeleteAfter = new DataProtectionBackupAbsoluteDeleteSetting(TimeSpan.FromDays(days));
+                    }
+                }
+            }
+        }
+
+        // PUT the modified policy back with original datasourceTypes preserved
+        var vaultId = DataProtectionBackupVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var vaultResource = armClient.GetDataProtectionBackupVaultResource(vaultId);
+        var collection = vaultResource.GetDataProtectionBackupPolicies();
+        await collection.CreateOrUpdateAsync(WaitUntil.Completed, policyName, policyData, cancellationToken);
+
+        return new OperationResult("Succeeded", null, $"Policy '{policyName}' updated in vault '{vaultName}'.");
+    }
+
     public async Task<OperationResult> CreatePolicyAsync(
         string vaultName, string resourceGroup, string subscription,
         string policyName, string workloadType,
