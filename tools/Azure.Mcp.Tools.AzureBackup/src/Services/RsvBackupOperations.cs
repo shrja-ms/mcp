@@ -1294,19 +1294,22 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             (nameof(subscription), subscription));
 
         var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
-        var vaultId = RecoveryServicesVaultResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
-        var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultId);
-        var vault = await vaultResource.GetAsync(cancellationToken);
 
-        var patchData = new RecoveryServicesVaultPatch(vault.Value.Data.Location)
-        {
-            Properties = new RecoveryServicesVaultProperties
-            {
-                RedundancySettings = ArmRecoveryServicesModelFactory.VaultPropertiesRedundancySettings(
-                    crossRegionRestore: CrossRegionRestore.Enabled)
-            }
-        };
-        await vaultResource.UpdateAsync(WaitUntil.Completed, patchData, cancellationToken);
+        // CRR must be enabled via the BackupResourceConfig sub-resource (backupstorageconfig),
+        // NOT via the vault-level PATCH which returns CloudInternalError.
+        var configResourceId = BackupResourceConfigResource.CreateResourceIdentifier(subscription, resourceGroup, vaultName);
+        var configResource = armClient.GetBackupResourceConfigResource(configResourceId);
+        var currentConfig = await configResource.GetAsync(cancellationToken);
+
+        // Update the data and use CreateOrUpdate via the collection
+        // (BackupResourceConfigResource.UpdateAsync has an SDK NullRef bug in its constructor)
+        var data = currentConfig.Value.Data;
+        data.Properties.EnableCrossRegionRestore = true;
+
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+        var collection = rgResource.GetBackupResourceConfigs();
+        await collection.CreateOrUpdateAsync(WaitUntil.Completed, vaultName, data, cancellationToken);
 
         return new OperationResult("Succeeded", null, $"Cross-Region Restore enabled for vault '{vaultName}'.");
     }
