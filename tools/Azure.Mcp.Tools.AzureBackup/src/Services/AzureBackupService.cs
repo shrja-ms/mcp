@@ -325,6 +325,15 @@ public class AzureBackupService(IRsvBackupOperations rsvOps, IDppBackupOperation
         return rsvOps.EnableAutoProtectionAsync(vaultName, resourceGroup, subscription, vmResourceId, instanceName, policyName, workloadType, tenant, retryPolicy, cancellationToken);
     }
 
+    public Task<List<ContainerInfo>> ListContainersAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? vaultType, string? tenant,
+        RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        // Container listing is an RSV-only feature (DPP vaults don't use the container concept)
+        return rsvOps.ListContainersAsync(vaultName, resourceGroup, subscription, tenant, retryPolicy, cancellationToken);
+    }
+
     public Task<OperationResult> RegisterContainerAsync(
         string vaultName, string resourceGroup, string subscription,
         string vmResourceId, string workloadType, string? vaultType, string? tenant,

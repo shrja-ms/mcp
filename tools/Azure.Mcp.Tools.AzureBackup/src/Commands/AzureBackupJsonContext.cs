@@ -54,6 +54,7 @@ namespace Azure.Mcp.Tools.AzureBackup.Commands;
 [JsonSerializable(typeof(BackupStatusCommand.BackupStatusCommandResult))]
 [JsonSerializable(typeof(RestoreTriggerCommand.RestoreTriggerCommandResult))]
 // Container
+[JsonSerializable(typeof(ContainerListCommand.ContainerListCommandResult))]
 [JsonSerializable(typeof(ContainerRegisterCommand.ContainerRegisterCommandResult))]
 [JsonSerializable(typeof(ContainerInquiryCommand.ContainerInquiryCommandResult))]
 // Protectable item
@@ -104,6 +105,7 @@ namespace Azure.Mcp.Tools.AzureBackup.Commands;
 [JsonSerializable(typeof(BackupJobInfo))]
 [JsonSerializable(typeof(RecoveryPointInfo))]
 [JsonSerializable(typeof(ProtectableItemInfo))]
+[JsonSerializable(typeof(ContainerInfo))]
 [JsonSerializable(typeof(VaultCreateResult))]
 [JsonSerializable(typeof(ProtectResult))]
 [JsonSerializable(typeof(BackupTriggerResult))]

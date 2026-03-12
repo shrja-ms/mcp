@@ -1373,6 +1373,37 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             data.Tags?.ToDictionary(t => t.Key, t => t.Value));
     }
 
+    private static ContainerInfo MapToContainerInfo(BackupProtectionContainerData data)
+    {
+        var properties = data.Properties;
+        string? workloadType = null;
+        string? sourceResourceId = null;
+        DateTimeOffset? lastUpdatedTime = null;
+
+        if (properties is VmAppContainerProtectionContainer vmAppContainer)
+        {
+            workloadType = vmAppContainer.WorkloadType?.ToString();
+            sourceResourceId = vmAppContainer.SourceResourceId?.ToString();
+            lastUpdatedTime = vmAppContainer.LastUpdatedOn;
+        }
+        else if (properties is IaasVmContainer iaasVmContainer)
+        {
+            workloadType = "AzureVM";
+            sourceResourceId = iaasVmContainer.VirtualMachineId?.ToString();
+        }
+
+        return new ContainerInfo(
+            data.Name,
+            properties?.FriendlyName,
+            properties?.RegistrationStatus,
+            properties?.HealthStatus,
+            properties?.ProtectableObjectType,
+            properties?.BackupManagementType?.ToString(),
+            sourceResourceId,
+            workloadType,
+            lastUpdatedTime);
+    }
+
     private static ProtectedItemInfo MapToProtectedItemInfo(BackupProtectedItemData data)
     {
         string? protectionStatus = null;
@@ -1612,6 +1643,43 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         {
             RecoveryType = FileShareRecoveryType.OriginalLocation
         };
+    }
+
+    public async Task<List<ContainerInfo>> ListContainersAsync(
+        string vaultName, string resourceGroup, string subscription,
+        string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken)
+    {
+        ValidateRequiredParameters(
+            (nameof(vaultName), vaultName),
+            (nameof(resourceGroup), resourceGroup),
+            (nameof(subscription), subscription));
+
+        var armClient = await CreateArmClientAsync(tenant, retryPolicy, cancellationToken: cancellationToken);
+        var rgId = ResourceGroupResource.CreateResourceIdentifier(subscription, resourceGroup);
+        var rgResource = armClient.GetResourceGroupResource(rgId);
+
+        // The REST API requires a backupManagementType filter, so query the main types
+        string[] backupManagementTypes = ["AzureWorkload", "AzureIaasVM", "AzureStorage", "MAB", "DPM"];
+        var containers = new List<ContainerInfo>();
+
+        foreach (var bmType in backupManagementTypes)
+        {
+            var filter = $"backupManagementType eq '{bmType}'";
+            try
+            {
+                await foreach (var container in rgResource.GetBackupProtectionContainersAsync(vaultName, filter, cancellationToken))
+                {
+                    containers.Add(MapToContainerInfo(container.Data));
+                }
+            }
+            catch (Azure.RequestFailedException ex) when (ex.Status == 400)
+            {
+                // Some backup management types may not be supported for all vault configurations; skip them
+                continue;
+            }
+        }
+
+        return containers;
     }
 
     public async Task<OperationResult> RegisterContainerAsync(

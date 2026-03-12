@@ -67,6 +67,7 @@ public class AzureBackupSetup : IAreaSetup
         services.AddSingleton<BackupStatusCommand>();
 
         // Container
+        services.AddSingleton<ContainerListCommand>();
         services.AddSingleton<ContainerRegisterCommand>();
         services.AddSingleton<ContainerInquiryCommand>();
 
@@ -179,8 +180,9 @@ public class AzureBackupSetup : IAreaSetup
         RegisterCommand<ProtectedItemAutoProtectCommand>(serviceProvider, protectedItem);
 
         // Container subgroup (SQL/HANA workload registration and inquiry)
-        var container = new CommandGroup("container", "Container operations - Register VMs and trigger database discovery for SQL/HANA workloads.");
+        var container = new CommandGroup("container", "Container operations - List, register VMs, and trigger database discovery for SQL/HANA workloads.");
         azureBackup.AddSubGroup(container);
+        RegisterCommand<ContainerListCommand>(serviceProvider, container);
         RegisterCommand<ContainerRegisterCommand>(serviceProvider, container);
         RegisterCommand<ContainerInquiryCommand>(serviceProvider, container);
 

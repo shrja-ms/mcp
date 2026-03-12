@@ -42,6 +42,7 @@ public interface IAzureBackupService
     Task<OperationResult> EnableAutoProtectionAsync(string vaultName, string resourceGroup, string subscription, string vmResourceId, string instanceName, string policyName, string workloadType, string? tenant = null, RetryPolicyOptions? retryPolicy = null, CancellationToken cancellationToken = default);
 
     // Container and workload discovery operations
+    Task<List<ContainerInfo>> ListContainersAsync(string vaultName, string resourceGroup, string subscription, string? vaultType = null, string? tenant = null, RetryPolicyOptions? retryPolicy = null, CancellationToken cancellationToken = default);
     Task<OperationResult> RegisterContainerAsync(string vaultName, string resourceGroup, string subscription, string vmResourceId, string workloadType, string? vaultType = null, string? tenant = null, RetryPolicyOptions? retryPolicy = null, CancellationToken cancellationToken = default);
     Task<OperationResult> TriggerInquiryAsync(string vaultName, string resourceGroup, string subscription, string containerName, string? workloadType = null, string? vaultType = null, string? tenant = null, RetryPolicyOptions? retryPolicy = null, CancellationToken cancellationToken = default);
     Task<List<ProtectableItemInfo>> ListProtectableItemsAsync(string vaultName, string resourceGroup, string subscription, string? workloadType = null, string? containerName = null, string? vaultType = null, string? tenant = null, RetryPolicyOptions? retryPolicy = null, CancellationToken cancellationToken = default);

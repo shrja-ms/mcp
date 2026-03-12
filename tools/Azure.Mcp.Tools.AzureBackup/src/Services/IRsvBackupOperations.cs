@@ -41,6 +41,7 @@ public interface IRsvBackupOperations
     Task<HealthCheckResult> RunBackupHealthCheckAsync(string vaultName, string resourceGroup, string subscription, int? rpoThresholdHours, bool includeSecurityPosture, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
 
     // Workload container operations (SQL/HANA in IaaS VM)
+    Task<List<ContainerInfo>> ListContainersAsync(string vaultName, string resourceGroup, string subscription, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<OperationResult> RegisterContainerAsync(string vaultName, string resourceGroup, string subscription, string vmResourceId, string workloadType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<OperationResult> TriggerInquiryAsync(string vaultName, string resourceGroup, string subscription, string containerName, string? workloadType, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
     Task<List<ProtectableItemInfo>> ListProtectableItemsAsync(string vaultName, string resourceGroup, string subscription, string? workloadType, string? containerName, string? tenant, RetryPolicyOptions? retryPolicy, CancellationToken cancellationToken);
