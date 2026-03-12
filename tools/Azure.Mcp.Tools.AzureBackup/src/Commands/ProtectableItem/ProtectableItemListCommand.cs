@@ -24,7 +24,8 @@ public sealed class ProtectableItemListCommand(ILogger<ProtectableItemListComman
         """
         Lists protectable items (SQL databases, SAP HANA databases) discovered in the Recovery Services vault.
         Use after registering a container and running inquiry to discover databases available for protection.
-        Filter results by workload type (SQLDataBase, SAPHanaDatabase) or container name.
+        Filter results by workload type or container name. Valid workload-type values include:
+        SAPHana, SAPHanaDatabase, SAPHanaSystem, SQL, SQLDataBase, SQLInstance.
         """;
     public override string Title => CommandTitle;
     public override ToolMetadata Metadata => new()

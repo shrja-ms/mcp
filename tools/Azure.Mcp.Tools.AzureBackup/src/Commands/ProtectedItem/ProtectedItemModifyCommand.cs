@@ -52,5 +52,13 @@ public sealed class ProtectedItemModifyCommand(ILogger<ProtectedItemModifyComman
         return context.Response;
     }
 
+    protected override string GetErrorMessage(Exception ex) => ex switch
+    {
+        InvalidOperationException opEx => opEx.Message,
+        ArgumentException argEx => argEx.Message,
+        RequestFailedException reqEx => reqEx.Message,
+        _ => base.GetErrorMessage(ex)
+    };
+
     internal record ProtectedItemModifyCommandResult([property: JsonPropertyName("result")] OperationResult Result);
 }

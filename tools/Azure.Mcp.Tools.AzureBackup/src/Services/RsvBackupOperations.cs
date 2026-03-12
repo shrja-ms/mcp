@@ -129,6 +129,17 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
                 throw new ArgumentException($"The --container parameter is required for {profile.FriendlyName} workload protection. Use 'azurebackup protectable_item_list' to discover containers and items.");
             }
 
+            // Bug #47: Detect if user passed an ARM resource ID instead of the protectable item name.
+            // For workloads, datasource-id must be the protectable item name (e.g., 'SAPHanaDatabase;instance;db')
+            // from 'protectableitem list', NOT the VM ARM resource ID.
+            if (datasourceId.StartsWith("/subscriptions/", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException(
+                    $"For {profile.FriendlyName} workload protection, --datasource-id must be the protectable item name " +
+                    $"(e.g., 'SAPHanaDatabase;instance;dbname'), not an ARM resource ID. " +
+                    $"Use 'azurebackup protectableitem list' to discover protectable item names.");
+            }
+
             var protectedItemName = datasourceId; // For workloads, datasourceId is the protectable item name
             var protectedItemId = BackupProtectedItemResource.CreateResourceIdentifier(
                 subscription, resourceGroup, vaultName, FabricName, containerName, protectedItemName);
@@ -1139,6 +1150,17 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var existingItem = await piResource.GetAsync(cancellationToken: cancellationToken);
         var existingProperties = existingItem.Value.Data.Properties;
 
+        // Bug #49: Check item state before attempting modify — IRPending items cannot be modified.
+        // ProtectionState is on concrete types, not the base BackupGenericProtectedItem.
+        var protectionState = GetProtectionState(existingProperties);
+        if (string.Equals(protectionState, "IRPending", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Cannot modify protection for '{protectedItemName}' because it is in '{protectionState}' state. " +
+                $"The initial replication (IR) must complete before the policy can be changed. " +
+                $"Use 'azurebackup job list' to monitor the IR job, then retry after it completes.");
+        }
+
         ResourceIdentifier? policyArmId = null;
         if (!string.IsNullOrEmpty(newPolicyName))
         {
@@ -1776,7 +1798,11 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         string filter;
         if (!string.IsNullOrEmpty(workloadType))
         {
-            filter = $"backupManagementType eq 'AzureWorkload' and workloadType eq '{workloadType}'";
+            // Normalize workload-type values to what the REST API filter expects (Bug #46).
+            // Users may pass common names like "SAPHana" but the API filter requires
+            // specific values like "SAPHanaDatabase" or "SAPHanaDBInstance".
+            var normalizedType = NormalizeWorkloadTypeForFilter(workloadType);
+            filter = $"backupManagementType eq 'AzureWorkload' and workloadType eq '{normalizedType}'";
         }
         else
         {
@@ -1826,27 +1852,33 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
         var vaultResource = armClient.GetRecoveryServicesVaultResource(vaultResId);
         var vault = await vaultResource.GetAsync(cancellationToken: cancellationToken);
 
-        // Build container and protectable item references for the intent (Bug #39: use VMAppContainer prefix + WorkloadSqlAutoProtectionIntent)
+        // Build container and protectable item references for the intent
         var containerName = $"VMAppContainer;Compute;{vmId.ResourceGroupName};{vmId.Name}";
         var itemId = $"/subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/Microsoft.RecoveryServices/vaults/{vaultName}/backupFabrics/Azure/protectionContainers/{containerName}/protectableItems/{instanceName}";
 
+        // Bug #48: Use WorkloadSqlAutoProtectionIntent for all workload types (SQL and HANA).
+        // Despite the "Sql" in the name, this is the only SDK intent type that supports
+        // the WorkloadItemType property needed to distinguish SQL vs HANA auto-protection.
+        // The REST API type is AzureWorkloadSQLAutoProtectionIntent for both SQL and HANA.
         var workloadItemType = workloadType?.ToUpperInvariant() switch
         {
-            "SQLDATABASE" or "SQLINSTANCE" => WorkloadItemType.SqlInstance,
-            "SAPHANA" or "SAPHANADATABASE" or "SAPHANASYSTEM" => WorkloadItemType.SapHanaSystem,
-            _ => WorkloadItemType.SqlInstance,
+            "SQLDATABASE" or "SQLINSTANCE" or "SQL" => WorkloadItemType.SqlInstance,
+            "SAPHANA" or "SAPHANADATABASE" or "SAPHANASYSTEM" or "SAPHANADBINSTANCE" => WorkloadItemType.SapHanaSystem,
+            _ => new WorkloadItemType(workloadType ?? "Invalid"),
+        };
+
+        var intentProperties = new WorkloadSqlAutoProtectionIntent
+        {
+            BackupManagementType = BackupManagementType.AzureWorkload,
+            ItemId = new ResourceIdentifier(itemId),
+            PolicyId = policyArmId,
+            SourceResourceId = new ResourceIdentifier(vmResourceId),
+            WorkloadItemType = workloadItemType,
         };
 
         var intentData = new BackupProtectionIntentData(vault.Value.Data.Location)
         {
-            Properties = new WorkloadSqlAutoProtectionIntent
-            {
-                BackupManagementType = BackupManagementType.AzureWorkload,
-                ItemId = new ResourceIdentifier(itemId),
-                PolicyId = policyArmId,
-                SourceResourceId = new ResourceIdentifier(vmResourceId),
-                WorkloadItemType = workloadItemType,
-            }
+            Properties = intentProperties
         };
 
         await intentResource.UpdateAsync(WaitUntil.Started, intentData, cancellationToken);
@@ -1856,6 +1888,34 @@ public class RsvBackupOperations(ITenantService tenantService) : BaseAzureServic
             null,
             $"Auto-protection enabled for '{instanceName}' on VM '{vmId.Name}' with policy '{policyName}'.");
     }
+
+    /// <summary>
+    /// Normalizes user-provided workload type values to the API filter format.
+    /// The REST API filter expects specific types like "SAPHanaDatabase" but users
+    /// commonly pass "SAPHana" (which is what the API returns in workloadType fields).
+    /// </summary>
+    private static string NormalizeWorkloadTypeForFilter(string workloadType) => workloadType.ToUpperInvariant() switch
+    {
+        "SAPHANA" => "SAPHanaDatabase",
+        "SAPHANASYSTEM" => "SAPHanaSystem",
+        "SAPHANADBINSTANCE" or "SAPHANADBI" => "SAPHanaDBInstance",
+        "SQL" => "SQLDataBase",
+        "SQLINSTANCE" => "SQLInstance",
+        _ => workloadType, // Pass through if already in correct format (e.g., "SAPHanaDatabase", "SQLDataBase")
+    };
+
+    /// <summary>
+    /// Extracts the ProtectionState from concrete protected item types.
+    /// The base BackupGenericProtectedItem does not expose ProtectionState directly.
+    /// </summary>
+    private static string? GetProtectionState(BackupGenericProtectedItem? properties) => properties switch
+    {
+        VmWorkloadSapHanaDatabaseProtectedItem hana => hana.ProtectionState?.ToString(),
+        VmWorkloadSqlDatabaseProtectedItem sql => sql.ProtectionState?.ToString(),
+        IaasComputeVmProtectedItem vm => vm.ProtectionState?.ToString(),
+        FileshareProtectedItem fs => fs.ProtectionState?.ToString(),
+        _ => null,
+    };
 
     private static ProtectableItemInfo MapToProtectableItemInfo(WorkloadProtectableItemResource data)
     {

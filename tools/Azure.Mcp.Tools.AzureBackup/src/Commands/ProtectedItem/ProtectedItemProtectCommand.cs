@@ -24,7 +24,10 @@ public sealed class ProtectedItemProtectCommand(ILogger<ProtectedItemProtectComm
     public override string Description =>
         """
         Enables backup protection for a resource by creating a protected item or backup instance.
-        Requires the datasource ARM resource ID and a backup policy name. The operation is asynchronous;
+        For VMs: pass the VM ARM resource ID as --datasource-id.
+        For workloads (SQL/HANA): pass the protectable item name from 'protectableitem list' as --datasource-id
+        (e.g., 'SAPHanaDatabase;instance;dbname'), and specify --container.
+        Requires a backup policy name. The operation is asynchronous;
         use 'azurebackup job get' to monitor the protection job progress.
         """;
     public override string Title => CommandTitle;
